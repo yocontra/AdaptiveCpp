@@ -352,6 +352,17 @@ public:
   // Unload entire cache and release resources to prepare runtime shutdown.
   void unload();
 
+  // Drop every cached code_object whose managing_backend() matches `b`,
+  // without running its destructor. Intended for use in a backend's own
+  // post-fork reset path: the inherited code objects hold backend handles
+  // (MTL::Library*, CUmodule, hipModule_t, ze_module_handle_t) that are
+  // only valid to release from the process that created them; running the
+  // destructor in the child would either crash or silently release a handle
+  // already invalidated by fork. Called by the backend under the same
+  // dispatch chokepoint that detects the fork, so no other path can observe
+  // the abandoned entries before they are gone from the map.
+  void drop_code_objects_for_backend(backend_id b);
+
   // Stitches together the persisten cache path with the id of the binary to a unique path.
   static std::string get_persistent_cache_file(code_object_id id_of_binary);
 private:

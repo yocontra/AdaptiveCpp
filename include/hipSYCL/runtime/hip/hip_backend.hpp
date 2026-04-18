@@ -12,6 +12,7 @@
 
 #include "../backend.hpp"
 #include "../multi_queue_executor.hpp"
+#include "../common/pid_guard.hpp"
 
 #include "hip_allocator.hpp"
 #include "hip_queue.hpp"
@@ -46,8 +47,17 @@ public:
 
   hip_event_pool* get_event_pool(device_id dev) const;
 private:
+  // Detect fork-without-exec at dispatch entry. libhsakmt's KFD thunk
+  // supports re-attach (see hsakmt_is_forked_child / clear_after_fork in
+  // its openclose.c), so ROCm can transparently recover: we drop the
+  // inherited HIP code objects + executor + device vectors and rebuild
+  // against the current process on next use.
+  void maybe_reset_after_fork() const;
+  void reset_after_fork_internal() const;
+
   mutable hip_hardware_manager _hw_manager;
   mutable lazily_constructed_executor<multi_queue_executor> _executor;
+  mutable pid_guard _fork_guard;
 };
 
 }

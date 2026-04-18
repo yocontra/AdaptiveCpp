@@ -24,6 +24,7 @@ class Device;
 class Library;
 class Function;
 class ComputePipelineState;
+class BinaryArchive;
 } // namespace MTL
 
 namespace hipsycl {
@@ -38,6 +39,14 @@ public:
   virtual result get_build_result() const = 0;
 
   virtual MTL::Device* get_device() const = 0;
+
+  // Per-library MTLBinaryArchive containing pre-compiled AGX machine code
+  // for every exported kernel. Owned by the executable object; may be null
+  // if archive build failed (e.g. forked child without MTLCompilerService
+  // access and no cached .metalar on disk). Used at pipeline-state creation
+  // with MTLPipelineOptionFailOnBinaryArchiveMiss to avoid post-fork XPC
+  // lookups to MTLCompilerService.
+  virtual MTL::BinaryArchive* get_binary_archive() const = 0;
 };
 
 class metal_sscp_executable_object : public metal_executable_object {
@@ -48,6 +57,15 @@ public:
                                const std::vector<std::string> &kernel_names,
                                MTL::Device* device,
                                const kernel_configuration &config);
+
+  // Non-copyable and non-movable: owns raw MTL::Library / MTL::BinaryArchive
+  // pointers that are released in the destructor.
+  metal_sscp_executable_object(const metal_sscp_executable_object&) = delete;
+  metal_sscp_executable_object&
+  operator=(const metal_sscp_executable_object&) = delete;
+  metal_sscp_executable_object(metal_sscp_executable_object&&) = delete;
+  metal_sscp_executable_object&
+  operator=(metal_sscp_executable_object&&) = delete;
 
   virtual ~metal_sscp_executable_object();
 
@@ -66,6 +84,7 @@ public:
 
   virtual MTL::Library* get_library() const override;
   virtual MTL::Device* get_device() const override;
+  virtual MTL::BinaryArchive* get_binary_archive() const override;
 
   const std::string& get_msl_source() const { return _msl_source; }
 
@@ -79,6 +98,7 @@ private:
   kernel_configuration::id_type _id;
   MTL::Device* _device;
   MTL::Library* _library;
+  MTL::BinaryArchive* _archive;
 
   // Keep the MSL source for potential debugging
   std::string _msl_source;

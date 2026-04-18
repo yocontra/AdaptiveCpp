@@ -61,6 +61,7 @@ backend_id cuda_backend::get_unique_backend_id() const {
 }
 
 backend_hardware_manager *cuda_backend::get_hardware_manager() const {
+  fail_if_forked();
   return &_hw_manager;
 }
 
@@ -72,6 +73,7 @@ backend_executor *cuda_backend::get_executor(device_id dev) const {
     return nullptr;
   }
 
+  fail_if_forked();
   return _executor.get();
 }
 
@@ -87,6 +89,28 @@ cuda_event_pool* cuda_backend::get_event_pool(device_id dev) const {
   return static_cast<cuda_hardware_context *>(
              get_hardware_manager()->get_device(dev.get_id()))
       ->get_event_pool();
+}
+
+void cuda_backend::fail_if_forked() const {
+  if (!_fork_guard.forked())
+    return;
+
+  register_error(
+      __acpp_here(),
+      error_info{
+          "cuda_backend: CUDA cannot be used in a forked child process. "
+          "NVIDIA documents this as undefined behavior (CUDA C Programming "
+          "Guide: \"CUDA does not duplicate any of its internal data "
+          "structures\"). Use multiprocessing with fork+exec, the Python "
+          "'spawn' start method, MPI for multi-process work, or NVIDIA "
+          "MPS for multi-tenant GPU sharing. See "
+          "https://docs.nvidia.com/cuda/cuda-c-programming-guide/"
+          "#cuda-and-fork",
+          error_type::runtime_error});
+
+  // Rearm so subsequent dispatches in the same child don't spam the same
+  // error. The backend state stays abandoned — this child cannot recover.
+  _fork_guard.rearm();
 }
 
 std::string cuda_backend::get_name() const {

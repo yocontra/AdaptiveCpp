@@ -9,6 +9,7 @@
  */
 // SPDX-License-Identifier: BSD-2-Clause
 #include "hipSYCL/runtime/backend_loader.hpp"
+#include "hipSYCL/runtime/kernel_cache.hpp"
 #include "hipSYCL/runtime/metal/metal_backend.hpp"
 
 HIPSYCL_PLUGIN_API_EXPORT
@@ -48,6 +49,7 @@ backend_id metal_backend::get_unique_backend_id() const {
 }
 
 backend_hardware_manager* metal_backend::get_hardware_manager() const {
+  maybe_reset_after_fork();
   return &_hw;
 }
 backend_executor* metal_backend::get_executor(device_id dev) const {
@@ -61,6 +63,7 @@ backend_executor* metal_backend::get_executor(device_id dev) const {
     return nullptr;
   }
 
+  maybe_reset_after_fork();
   return _executor.get();
 }
 backend_allocator *metal_backend::get_allocator(device_id dev) const {
@@ -73,6 +76,7 @@ backend_allocator *metal_backend::get_allocator(device_id dev) const {
     );
     return nullptr;
   }
+  maybe_reset_after_fork();
   return _hw.get_allocator(dev.get_id());
 }
 
@@ -84,6 +88,35 @@ std::unique_ptr<backend_executor>
 metal_backend::create_inorder_executor(device_id dev, int priority) {
   std::unique_ptr<inorder_queue> q(_hw.make_queue(dev.get_id()));
   return std::make_unique<inorder_executor>(std::move(q));
+}
+
+void metal_backend::maybe_reset_after_fork() const {
+  if (_fork_guard.forked()) {
+    reset_after_fork_internal();
+    _fork_guard.rearm();
+  }
+}
+
+void metal_backend::reset_after_fork_internal() const {
+  // Order matters:
+  //  1. Drop Metal code objects from the shared kernel cache: they hold
+  //     MTL::Library* / MTL::BinaryArchive* owned by the parent process;
+  //     running their destructors here walks parent-side GPU memory and
+  //     crashes. drop_code_objects_for_backend() releases the unique_ptrs
+  //     without destroying so the leaks stay localized to this one event.
+  //  2. Abandon the multi_queue_executor: it holds metal_inorder_queue
+  //     objects with MTLCommandQueue / MTLSharedEvent / SharedEventListener
+  //     — release() into those walks parent-process IOGPUDevice memory.
+  //  3. Reset the hardware manager: abandon the inherited MTLDevice
+  //     vectors, re-enumerate against a process-local XPC link.
+  //
+  // The next dispatch rebuilds everything against fresh handles; compiled
+  // .metallib / .metalar files on disk are still reusable and reload
+  // without touching MTLCompilerService in the child.
+  if (auto cache = kernel_cache::get())
+    cache->drop_code_objects_for_backend(backend_id::metal);
+  _executor.abandon_after_fork();
+  _hw.reset_after_fork();
 }
 
 metal_backend::~metal_backend() = default;

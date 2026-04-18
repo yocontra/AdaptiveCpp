@@ -70,11 +70,18 @@ public:
   virtual device_id get_device_id(std::size_t index) const override;
   virtual std::size_t get_num_platforms() const override;
 
+  // Release the inherited MTLDevice (and everything built on top of it) and
+  // re-enumerate. Used by metal_backend::reset_after_fork() so the child side
+  // of fork() gets a fresh MTLDevice with its own process-local XPC link.
+  void reset_after_fork();
+
   virtual ~metal_hardware_manager();
 private:
   friend class metal_backend;
   metal_allocator* get_allocator(size_t index);
   metal_inorder_queue* make_queue(size_t index);
+
+  void rebuild_devices();
 
   std::vector<MTL::Device*> _devices;
   std::vector<metal_hardware_context> _contexts;

@@ -684,6 +684,10 @@ metal_hardware_context::~metal_hardware_context() = default;
 
 metal_hardware_manager::metal_hardware_manager()
 {
+  rebuild_devices();
+}
+
+void metal_hardware_manager::rebuild_devices() {
   auto device = MTL::CreateSystemDefaultDevice();
   if (device) {
     auto id = device_id{
@@ -694,6 +698,19 @@ metal_hardware_manager::metal_hardware_manager()
     _contexts.emplace_back(metal_hardware_context{device});
     _allocators.emplace_back(device, id);
   }
+}
+
+void metal_hardware_manager::reset_after_fork() {
+  // Abandon inherited MTLDevice pointers without calling release(). The
+  // release path triggers IOGPUDevice / AGX heap teardown that walks parent
+  // process memory and crashes in the child. The parent's GPU resources
+  // will be reclaimed when it exits; what matters here is that the child
+  // rebuilds a fresh MTLDevice with a process-local XPC connection.
+  _devices.clear();
+  _contexts.clear();
+  _allocators.clear();
+
+  rebuild_devices();
 }
 
 metal_inorder_queue* metal_hardware_manager::make_queue(size_t index) {

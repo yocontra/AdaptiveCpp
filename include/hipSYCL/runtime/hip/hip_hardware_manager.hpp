@@ -82,8 +82,18 @@ public:
   virtual std::size_t get_num_platforms() const override;
 
   virtual ~hip_hardware_manager() {}
-  
+
+  // Abandon inherited hip_hardware_context objects (they own unique_ptrs to
+  // hip_allocator / hip_event_pool, which hold per-device hipStream_t and
+  // hipEvent_t handles inherited from the parent) and re-enumerate against
+  // the current process. Called by hip_backend::reset_after_fork_internal()
+  // on the child side of fork() — hipInit drives libhsakmt's KFD re-attach
+  // as a side effect.
+  void reset_after_fork();
+
 private:
+  void rebuild_devices();
+
   std::vector<hip_hardware_context> _devices;
   hardware_platform _hw_platform;
 };

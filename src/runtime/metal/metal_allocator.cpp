@@ -200,8 +200,10 @@ void* metal_allocator::raw_allocate(
   size_t min_alignment, size_t size_bytes,
   const allocation_hints &hints)
 {
-  auto storage_mode = MTL::ResourceStorageModePrivate;
-  auto buffer = _device->newBuffer(size_bytes, storage_mode);
+  auto buffer = alloc_buffer(size_bytes);
+  if (!buffer) {
+    return nullptr;
+  }
   // Metal shared/host USM uses host VA as the canonical pointer. Since
   // gpuAddress = canonical + _delta is bijective, device USM can use the same
   // canonical space by subtracting _delta from the native GPU address.
@@ -256,6 +258,10 @@ void metal_allocator::raw_free(void *mem)
 {
   if (!mem) return;
 
+  // Note: this is only ever called for allocations owned by *this* allocator
+  // instance. Post-fork, metal_hardware_manager::reset_after_fork() destroys
+  // and rebuilds the allocator, so any buffers inherited from the parent are
+  // abandoned (not released) before raw_free() can see them.
   std::lock_guard<std::mutex> lock{_mutex};
   auto it = _ptr_to_block.find(mem);
   if (it != _ptr_to_block.end()) {

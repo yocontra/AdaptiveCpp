@@ -179,6 +179,17 @@ public:
     }
   }
 
+  // Drop the cached instance without destroying it, so the next get() re-runs
+  // the factory. The parent's executor owns backend handles (command queues,
+  // shared events, worker threads) that are invalid on the child side of
+  // fork() — leaking is deliberate. Called only from per-backend fork reset
+  // paths; background workers have already died on fork().
+  void abandon_after_fork() {
+    std::lock_guard<std::mutex> lock{_mutex};
+    (void)_ptr.release();
+    _is_initialized.store(false, std::memory_order_release);
+  }
+
 private:
   std::atomic<bool> _is_initialized;
   std::mutex _mutex;

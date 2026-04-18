@@ -13,6 +13,7 @@
 
 #include "../backend.hpp"
 #include "../multi_queue_executor.hpp"
+#include "../common/pid_guard.hpp"
 #include "hipSYCL/runtime/metal/metal_hardware_manager.hpp"
 
 namespace hipsycl {
@@ -38,9 +39,17 @@ public:
 
   std::unique_ptr<backend_executor>
   create_inorder_executor(device_id dev, int priority) override;
+
 private:
+  // Fork detection. Called from the dispatch chokepoints before any Metal
+  // handle from the parent is touched, so the first post-fork dispatch
+  // transparently recovers instead of crashing in MTLCompilerService.
+  void maybe_reset_after_fork() const;
+  void reset_after_fork_internal() const;
+
   mutable metal_hardware_manager _hw;
   mutable lazily_constructed_executor<multi_queue_executor> _executor;
+  mutable pid_guard _fork_guard;
 };
 
 } // namespace rt

@@ -12,6 +12,7 @@
 
 #include "../backend.hpp"
 #include "../multi_queue_executor.hpp"
+#include "../common/pid_guard.hpp"
 
 #include "cuda_allocator.hpp"
 #include "cuda_queue.hpp"
@@ -46,8 +47,20 @@ public:
   virtual std::unique_ptr<backend_executor>
   create_inorder_executor(device_id dev, int priority) override;
 private:
+  // Detect fork-without-exec at dispatch entry. Unlike Metal and HIP, the
+  // CUDA driver documents any use of CUDA after fork() without exec() as
+  // undefined behavior (CUDA C Programming Guide: "CUDA does not duplicate
+  // any of its internal data structures"); in practice a forked child sees
+  // CUDA_ERROR_NOT_INITIALIZED plus corrupted context state. Every
+  // mainstream CUDA framework (PyTorch, TensorFlow, JAX, RAPIDS, cuPy)
+  // refuses loudly instead of attempting recovery. This backend does the
+  // same: register_error with a clear pointer at the supported alternatives
+  // (fork+exec, spawn, MPI, MPS).
+  void fail_if_forked() const;
+
   mutable cuda_hardware_manager _hw_manager;
   mutable lazily_constructed_executor<multi_queue_executor> _executor;
+  mutable pid_guard _fork_guard;
 };
 
 }

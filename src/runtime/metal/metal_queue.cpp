@@ -115,7 +115,8 @@ result launch_kernel_from_library(
   std::size_t* arg_sizes,
   std::size_t num_args,
   const rt::hcf_kernel_info* kernel_info,
-  const std::optional<std::vector<int>>& retained_indices)
+  const std::optional<std::vector<int>>& retained_indices,
+  MTL::BinaryArchive* binary_archive)
 {
   if (!library) {
     return make_error(__acpp_here(),
@@ -134,8 +135,31 @@ result launch_kernel_from_library(
                                  std::string(kernel_name)});
   }
 
+  // Build pipeline via descriptor so we can pass a pre-populated
+  // MTLBinaryArchive (produced out-of-process by acpp-metal-archive-build)
+  // together with MTL::PipelineOptionFailOnBinaryArchiveMiss. When the
+  // archive is present, pipeline creation is a pure deserialization and
+  // never round-trips to MTLCompilerService — which is critical in a
+  // PostgreSQL backend forked without exec, where the parent's XPC
+  // connection is no longer reachable.
+  NS::SharedPtr<MTL::ComputePipelineDescriptor> pipe_desc =
+      NS::TransferPtr(MTL::ComputePipelineDescriptor::alloc()->init());
+  pipe_desc->setComputeFunction(function.get());
+
+  MTL::PipelineOption pipeline_options = MTL::PipelineOptionNone;
+  NS::SharedPtr<NS::Array> archives_array;
+  if (binary_archive) {
+    const MTL::BinaryArchive* raw = binary_archive;
+    archives_array = NS::TransferPtr(NS::Array::alloc()->init(
+        reinterpret_cast<const NS::Object* const*>(&raw), 1));
+    pipe_desc->setBinaryArchives(archives_array.get());
+    pipeline_options = MTL::PipelineOptionFailOnBinaryArchiveMiss;
+  }
+
   NS::Error* error = nullptr;
-  NS::SharedPtr<MTL::ComputePipelineState> pipeline_state = NS::TransferPtr(device->newComputePipelineState(function.get(), &error));
+  NS::SharedPtr<MTL::ComputePipelineState> pipeline_state = NS::TransferPtr(
+      device->newComputePipelineState(pipe_desc.get(), pipeline_options,
+                                      /*reflection=*/nullptr, &error));
 
   if (error || !pipeline_state) {
     std::string error_msg = "metal: Failed to create compute pipeline state";
@@ -390,32 +414,72 @@ result metal_inorder_queue::submit_memcpy(memcpy_operation& op, const dag_node_p
                  error_type::invalid_parameter_error});
   }
 
-  if (!src_is_device && !dst_is_device) {
-    auto do_h2h_copy = [=]() {
+  // Fork-safe fast path for Apple Silicon: resolve any "device" USM
+  // pointers to their shared-storage contents() pointers. If both
+  // endpoints are CPU-addressable, do pure CPU memcpy and skip
+  // MTLBlitCommandEncoder entirely — the blit encoder on AGX drivers
+  // JIT-compiles blit compute programs via MTLCompilerService (XPC),
+  // which is not fork-safe: forked PG-style backends crash in
+  // findOrCreateBlitProgramVariant on first memcpy.
+  //
+  // On Apple Silicon, unified memory makes shared-storage CPU access
+  // as fast as blit-encoded GPU copy, so we lose nothing.
+  void* src_cpu_base = nullptr;
+  size_t src_cpu_off = 0;
+  void* dst_cpu_base = nullptr;
+  size_t dst_cpu_off = 0;
+
+  auto resolve_cpu = [&](bool is_device, MTL::Buffer* buf, void* ptr,
+                         void*& out_base, size_t& out_off) -> bool {
+    if (!is_device) {
+      out_base = ptr;
+      out_off = 0;
+      return true;
+    }
+    if (!buf) return false;
+    if (buf->storageMode() != MTL::StorageModeShared) return false;
+    out_base = buf->contents();
+    // get_usm_block's "offset" is the byte offset within the buffer for ptr.
+    auto [_b, usm_off, _t] = _allocator->get_usm_block(ptr);
+    out_off = usm_off;
+    return true;
+  };
+
+  bool src_cpu_ok = resolve_cpu(src_is_device, src_buffer, src_ptr,
+                                src_cpu_base, src_cpu_off);
+  bool dst_cpu_ok = resolve_cpu(dst_is_device, dst_buffer, dst_ptr,
+                                dst_cpu_base, dst_cpu_off);
+
+  if (src_cpu_ok && dst_cpu_ok) {
+    auto do_cpu_copy = [=]() {
       for (std::size_t surface = 0; surface < transferred_range[0]; ++surface) {
         for (std::size_t row = 0; row < transferred_range[1]; ++row) {
           id<3> src = src_offset; src[0] += surface; src[1] += row;
           id<3> dst = dest_offset; dst[0] += surface; dst[1] += row;
 
-          const char* src_byte_ptr = (const char*)src_ptr +
+          const char* src_byte_ptr = (const char*)src_cpu_base + src_cpu_off +
             linear_index(src, src_allocation_shape) * src_element_size;
-          char* dst_byte_ptr = (char*)dst_ptr +
+          char* dst_byte_ptr = (char*)dst_cpu_base + dst_cpu_off +
             linear_index(dst, dest_allocation_shape) * dest_element_size;
           memcpy(dst_byte_ptr, src_byte_ptr, transferred_range[2] * src_element_size);
         }
       }
     };
 
-    auto prev_cpu_event = std::exchange(_pending_cpu_event, uint64_t{0});
-    if (prev_cpu_event == 0) {
-      do_h2h_copy();
+    // Serialize with prior in-order work. _pending_gpu_event fires on GPU
+    // completion; _pending_cpu_event fires from prior notifyListener
+    // callbacks. Waiting on the max of both suffices.
+    uint64_t prev_cpu_event = std::exchange(_pending_cpu_event, uint64_t{0});
+    uint64_t prev_gpu_event = _pending_gpu_event;
+    uint64_t wait_val = prev_cpu_event > prev_gpu_event ? prev_cpu_event : prev_gpu_event;
+
+    if (wait_val == 0) {
+      do_cpu_copy();
     } else {
-      // wait for the prior CPU async work (e.g. device->host copy) to complete
-      // before reading from src_ptr
       auto val_done = ++_event_counter;
-      _shared_event->notifyListener(_event_listener, prev_cpu_event,
+      _shared_event->notifyListener(_event_listener, wait_val,
         [=](MTL::SharedEvent* evt, uint64_t) {
-          do_h2h_copy();
+          do_cpu_copy();
           evt->setSignaledValue(val_done);
         });
       _pending_gpu_event = val_done;
@@ -636,6 +700,40 @@ result metal_inorder_queue::submit_memset(memset_operation& op, const dag_node_p
   unsigned char pattern = op.get_pattern();
   std::size_t num_bytes = op.get_num_bytes();
 
+  // Fork-safe fast path for Apple Silicon: if the USM buffer is
+  // shared-storage, memset its contents() on CPU and skip
+  // MTLBlitCommandEncoder::fillBuffer entirely. The blit fill path causes
+  // AGX drivers to JIT-compile an internal blit compute program via
+  // MTLCompilerService (XPC), which is not fork-safe: forked PG-style
+  // backends abort in findOrCreateBlitProgramVariant on first memset.
+  // UMA makes shared-storage CPU access as fast as a GPU blit.
+  auto [buffer, usm_offset, _alloc_type] = _allocator->get_usm_block(ptr);
+  if (buffer && buffer->storageMode() == MTL::StorageModeShared) {
+    void* cpu_base = buffer->contents();
+    std::size_t cpu_off = usm_offset;
+    auto do_cpu_memset = [=]() {
+      memset((char*)cpu_base + cpu_off, pattern, num_bytes);
+    };
+
+    uint64_t prev_cpu_event = std::exchange(_pending_cpu_event, uint64_t{0});
+    uint64_t prev_gpu_event = _pending_gpu_event;
+    uint64_t wait_val = prev_cpu_event > prev_gpu_event ? prev_cpu_event : prev_gpu_event;
+
+    if (wait_val == 0) {
+      do_cpu_memset();
+    } else {
+      auto val_done = ++_event_counter;
+      _shared_event->notifyListener(_event_listener, wait_val,
+        [=](MTL::SharedEvent* evt, uint64_t) {
+          do_cpu_memset();
+          evt->setSignaledValue(val_done);
+        });
+      _pending_gpu_event = val_done;
+      _pending_cpu_event = val_done;
+    }
+    return make_success();
+  }
+
   NS::SharedPtr<NS::AutoreleasePool> pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
 
   profiling_setup(op, node);
@@ -842,7 +940,8 @@ result metal_inorder_queue::submit_sscp_kernel_from_code_object(hcf_object_id hc
     const_cast<std::size_t*>(_arg_mapper.get_mapped_arg_sizes()),
     _arg_mapper.get_mapped_num_args(),
     kernel_info,
-    retained_indices);
+    retained_indices,
+    metal_obj->get_binary_archive());
 
 #else
   return make_error(__acpp_here(),

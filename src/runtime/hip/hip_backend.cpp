@@ -14,6 +14,7 @@
 #include "hipSYCL/runtime/hip/hip_event.hpp"
 #include "hipSYCL/runtime/hip/hip_target.hpp"
 #include "hipSYCL/runtime/hip/hip_queue.hpp"
+#include "hipSYCL/runtime/kernel_cache.hpp"
 #include "hipSYCL/runtime/multi_queue_executor.hpp"
 
 HIPSYCL_PLUGIN_API_EXPORT
@@ -70,6 +71,7 @@ backend_id hip_backend::get_unique_backend_id() const {
 }
 
 backend_hardware_manager *hip_backend::get_hardware_manager() const {
+  maybe_reset_after_fork();
   return &_hw_manager;
 }
 
@@ -81,6 +83,7 @@ backend_executor *hip_backend::get_executor(device_id dev) const {
     return nullptr;
   }
 
+  maybe_reset_after_fork();
   return _executor.get();
 }
 
@@ -96,6 +99,47 @@ hip_event_pool* hip_backend::get_event_pool(device_id dev) const {
   return static_cast<hip_hardware_context *>(
              get_hardware_manager()->get_device(dev.get_id()))
       ->get_event_pool();
+}
+
+void hip_backend::maybe_reset_after_fork() const {
+  if (_fork_guard.forked()) {
+    reset_after_fork_internal();
+    _fork_guard.rearm();
+  }
+}
+
+void hip_backend::reset_after_fork_internal() const {
+#if defined(HIPSYCL_RT_HIP_TARGET_ROCM)
+  // ROCm / libhsakmt supports fork-without-exec: the KFD thunk's
+  // hsakmt_is_forked_child() + clear_after_fork() path re-attaches
+  // /dev/kfd, rebuilds doorbells/events, and restores the VM aperture on
+  // the first post-fork ioctl. Cooperate by dropping inherited state and
+  // rebuilding.
+  if (auto cache = kernel_cache::get())
+    cache->drop_code_objects_for_backend(backend_id::hip);
+  _executor.abandon_after_fork();
+  _hw_manager.reset_after_fork();
+#elif defined(HIPSYCL_RT_HIP_TARGET_CUDA)
+  // HIP-over-CUDA: the underlying driver forbids fork-without-exec (see
+  // NVIDIA CUDA C Programming Guide). Match the native CUDA backend and
+  // refuse loudly rather than silently corrupt.
+  register_error(
+      __acpp_here(),
+      error_info{
+          "hip_backend (HIP-over-CUDA): the CUDA driver does not support "
+          "fork() without exec() and NVIDIA documents any use of CUDA in a "
+          "forked child as undefined behavior. Use fork+exec, the Python "
+          "'spawn' start method, MPI, or NVIDIA MPS for multi-tenant GPU "
+          "sharing. See "
+          "https://docs.nvidia.com/cuda/cuda-c-programming-guide/"
+          "#cuda-and-fork",
+          error_type::runtime_error});
+#else
+  // HIP-CPU: no device handles, nothing to rebuild.
+  if (auto cache = kernel_cache::get())
+    cache->drop_code_objects_for_backend(backend_id::hip);
+  _executor.abandon_after_fork();
+#endif
 }
 
 std::string hip_backend::get_name() const {

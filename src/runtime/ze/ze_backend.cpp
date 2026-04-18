@@ -83,10 +83,12 @@ backend_id ze_backend::get_unique_backend_id() const {
 }
   
 backend_hardware_manager* ze_backend::get_hardware_manager() const {
+  fail_if_forked();
   return _hardware_manager.get();
 }
 
 backend_executor* ze_backend::get_executor(device_id dev) const {
+  fail_if_forked();
   return _executor->get();
 }
 
@@ -94,6 +96,26 @@ backend_allocator *ze_backend::get_allocator(device_id dev) const {
   assert(dev.get_id() < _allocators.size());
 
   return &(_allocators[dev.get_id()]);
+}
+
+void ze_backend::fail_if_forked() const {
+  if (!_fork_guard.forked())
+    return;
+
+  register_error(
+      __acpp_here(),
+      error_info{
+          "ze_backend: Level Zero cannot be used in a forked child process. "
+          "The L0 spec requires zeInit() per-process; inherited driver / "
+          "context / device handles are invalid after fork() and L0 provides "
+          "no cross-process re-init path. Use fork+exec, the Python 'spawn' "
+          "start method, MPI for multi-process work, or per-process "
+          "initialization.",
+          error_type::runtime_error});
+
+  // Rearm so subsequent dispatches in the same child don't spam the same
+  // error. The backend state stays abandoned — this child cannot recover.
+  _fork_guard.rearm();
 }
 
 std::string ze_backend::get_name() const {

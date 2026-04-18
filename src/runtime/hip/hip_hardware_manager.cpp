@@ -76,6 +76,10 @@ hip_hardware_manager::hip_hardware_manager(hardware_platform hw_platform)
             "visibility masks. Use HIP_VISIBLE_DEVICES instead."});
   }
 
+  rebuild_devices();
+}
+
+void hip_hardware_manager::rebuild_devices() {
   int num_devices = 0;
 
   auto err = hipGetDeviceCount(&num_devices);
@@ -115,6 +119,33 @@ hip_hardware_manager::hip_hardware_manager(hardware_platform hw_platform)
       }
     }
   }
+}
+
+void hip_hardware_manager::reset_after_fork() {
+  // Leak the inherited _devices vector: its elements own unique_ptrs to
+  // hip_allocator / hip_event_pool that hold parent-process hipStream_t /
+  // hipEvent_t handles. Running their destructors in the child either
+  // calls into a driver handle already invalidated by libhsakmt's fork
+  // detect path or dispatches release() into parent-owned GPU state.
+  auto* leaked =
+      new std::vector<hip_hardware_context>{std::move(_devices)};
+  (void)leaked; // deliberate leak — parent reclaims at exit
+  _devices = std::vector<hip_hardware_context>{};
+
+  // hipInit(0) is the explicit reinit entry point. On ROCm this drives
+  // libhsakmt's hsakmt_is_forked_child() + clear_after_fork(): the KFD
+  // thunk reopens /dev/kfd, clears doorbells/events, and rebuilds the VM
+  // aperture for the child. hipErrorNotInitialized simply means the
+  // runtime was never initialized in the parent — nothing to re-init.
+  auto err = hipInit(0);
+  if (err != hipSuccess && err != hipErrorNotInitialized) {
+    print_warning(
+        __acpp_here(),
+        error_info{"hip_hardware_manager: hipInit(0) after fork failed",
+                   error_code{"HIP", err}});
+  }
+
+  rebuild_devices();
 }
 
 
