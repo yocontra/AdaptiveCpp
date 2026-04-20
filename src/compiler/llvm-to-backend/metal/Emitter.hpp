@@ -48,6 +48,7 @@ struct MetalEmitterOptions {
 class MetalEmitter {
 public:
   MetalEmitter(llvm::Module& M, const std::unordered_set<std::string>& kernelNames, const MetalEmitterOptions& opt = {});
+  ~MetalEmitter();
   bool emit(std::string& out);
   std::optional<std::string> errorMessage() const {
     return errorMsg;

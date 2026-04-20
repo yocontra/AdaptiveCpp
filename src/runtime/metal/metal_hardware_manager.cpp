@@ -716,16 +716,43 @@ metal_hardware_manager::metal_hardware_manager()
 }
 
 void metal_hardware_manager::rebuild_devices() {
-  auto device = MTL::CreateSystemDefaultDevice();
-  if (device) {
+  // Enumerate Metal devices via MTLCopyAllDevices (IOKit-backed) rather than
+  // MTLCreateSystemDefaultDevice. The default-device path funnels through
+  // SLSMainDisplayID -> WindowServer mach port lookup, which hangs in
+  // post-fork children (sandboxed processes cannot reach WindowServer).
+  // MTLCopyAllDevices uses IOKit only and is therefore fork-safe.
+  //
+  // Ownership: MTLCopyAllDevices returns a +1 retained NS::Array whose
+  // element references are +0 (autoreleased). We retain() each MTL::Device
+  // we keep so the stored pointers outlive the array, then release() the
+  // array exactly once. Matches the existing destructor which release()es
+  // each stored device.
+  NS::Array* devices = MTL::CopyAllDevices();
+  if (!devices || devices->count() == 0) {
+    if (devices) devices->release();
+    // Deliberate: no CPU fallback. Leaving _devices empty causes
+    // get_num_devices() == 0, which the runtime surfaces as "no Metal
+    // device available" — callers handle that cleanly.
+    HIPSYCL_DEBUG_WARNING
+      << "metal_hardware_manager: MTLCopyAllDevices returned no devices\n";
+    return;
+  }
+
+  NS::UInteger n = devices->count();
+  for (NS::UInteger i = 0; i < n; ++i) {
+    MTL::Device* device =
+      static_cast<MTL::Device*>(devices->object(i));
+    if (!device) continue;
+    device->retain();
     auto id = device_id{
       backend_descriptor{hardware_platform::metal, api_platform::metal},
-      0
+      static_cast<int>(i)
     };
     _devices.emplace_back(device);
     _contexts.emplace_back(metal_hardware_context{device});
     _allocators.emplace_back(device, id);
   }
+  devices->release();
 }
 
 void metal_hardware_manager::reset_after_fork() {

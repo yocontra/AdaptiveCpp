@@ -64,12 +64,23 @@ int main(int argc, char** argv) {
 
   NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
 
-  MTL::Device* device = MTL::CreateSystemDefaultDevice();
-  if (!device) {
-    log_err("MTLCreateSystemDefaultDevice returned null");
+  // Use MTLCopyAllDevices (IOKit-backed, WindowServer-free) for consistency
+  // with the runtime's metal_hardware_manager and to keep this helper
+  // usable in environments without a WindowServer (headless CI, sandboxed
+  // spawns). On Apple Silicon there is exactly one integrated GPU, so [0]
+  // is equivalent to the system default. Retain the device so it survives
+  // the array release below.
+  NS::Array* all_devices = MTL::CopyAllDevices();
+  if (!all_devices || all_devices->count() == 0) {
+    log_err("MTLCopyAllDevices returned no devices");
+    if (all_devices) all_devices->release();
     pool->release();
     return 3;
   }
+  MTL::Device* device =
+      static_cast<MTL::Device*>(all_devices->object(0));
+  device->retain();
+  all_devices->release();
 
   NS::Error* err = nullptr;
   MTL::Library* library = device->newLibrary(file_url(metallib_path), &err);

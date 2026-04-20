@@ -130,6 +130,29 @@ MetalEmitter::MetalEmitter(Module& M, const std::unordered_set<std::string>& ker
 {
 }
 
+// NOTE: this destructor is user-provided out-of-line *by design*.
+//
+// Prior to this, MetalEmitter had no user-declared destructor, so the compiler
+// generated an implicit inline destructor in every translation unit that
+// instantiated MetalEmitter. In libllvm-to-metal.dylib on macOS that implicit
+// destructor aggressively inlined and reordered the destruction of the
+// `std::ostringstream os` member (including its virtual-base `basic_ios`
+// subobject, which holds an `ios_base::__loc_` locale). On the fork-child
+// side of postmaster-style fork()-without-exec (observed in forked Postgres
+// backends and in tests/fork_safety/metal.cpp cold-fork), the generated path
+// ended up invoking `std::locale::~locale()` against an `__loc_` whose
+// `_Impl*` backing pointer was zero, faulting at offset 0x8 (the refcount
+// word inside `locale::_Impl`) on the very first kernel JIT dispatch.
+//
+// Providing an explicit, out-of-line destructor forces clang to emit the
+// ostringstream subobject destruction through the normal virtual-base VTT
+// path in a single, non-inlined function body. That eliminates the crash
+// without changing behavior -- the destructor still has no other work to do,
+// the string output has already been flushed via `out = os.str()` in
+// `emit()` before MetalEmitter goes out of scope, so `~ostringstream()`
+// now runs against a fully-initialized locale and succeeds.
+MetalEmitter::~MetalEmitter() = default;
+
 bool MetalEmitter::emit(std::string& out) {
   PassBuilder PB;
   LoopAnalysisManager LAM;
