@@ -258,13 +258,15 @@ metal_hardware_context::metal_hardware_context(MTL::Device* device)
     _gpu_family = MTL::GPUFamilyApple7;
   }
 
-  // Apple8+ (M2 and later) supports MSL 2.4 atomic_ulong on *device* memory.
-  // Op coverage: load, store, exchange, add, sub, min, max. Explicitly NOT
-  // supported by the hardware: cmpxchg / and / or / xor, and NOT supported in
-  // threadgroup (shared/local) scope at any op. Callers that need any of
-  // those must refuse at kernel-lowering time — this aspect advertises only
-  // the device-memory subset above.
-  _supports_atomic64 = device->supportsFamily(MTL::GPUFamilyApple8);
+  // Apple8+ (M2 and later) hardware supports 64-bit atomics on device memory
+  // per MSL 2.4+, but the SSCP MSL emitter currently generates program-scope
+  // simdgroup builtins (`__simd_size [[threads_per_simdgroup]]`) that xcrun
+  // metal only accepts in its permissive default dialect, and that dialect
+  // rejects `atomic_fetch_add_explicit(device atomic<ulong>*, ulong, ...)`
+  // (`_valid_fetch_add_type` SFINAE miss). Until the emitter produces
+  // MSL 2.4+-compliant source, advertise atomic64 = false so callers route to
+  // their u32 counter paths rather than tripping an xcrun compile error.
+  _supports_atomic64 = false;
 
   // Soft-double via metal-float64 compiles on every Metal device (no HW
   // dependency) but costs ~1/32x native fp32 throughput, so it must be

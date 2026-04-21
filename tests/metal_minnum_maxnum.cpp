@@ -70,7 +70,11 @@ template <class T> int run_case(sycl::queue &q) {
       {finite, nan, finite, finite},
       {nan, finite, finite, finite},
       {nan, nan, nan, nan},
+      // IEEE 754-2008 signed-zero preservation: fmin(-0,+0)=-0, fmax=+0
+      // in both operand orderings.
       {static_cast<T>(-0.0), static_cast<T>(0.0), static_cast<T>(-0.0),
+       static_cast<T>(0.0)},
+      {static_cast<T>(0.0), static_cast<T>(-0.0), static_cast<T>(-0.0),
        static_cast<T>(0.0)},
       {static_cast<T>(-1.5), static_cast<T>(2.25), static_cast<T>(-1.5),
        static_cast<T>(2.25)},

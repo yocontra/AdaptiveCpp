@@ -66,8 +66,28 @@ ACPP_SSCP_MAP_METAL_FLOAT_BUILTIN(rint)
 ACPP_SSCP_MAP_METAL_FLOAT_BUILTIN(fabs)
 ACPP_SSCP_MAP_METAL_FLOAT_BUILTIN2(copysign)
 ACPP_SSCP_MAP_METAL_FLOAT_BUILTIN3(fma)
-ACPP_SSCP_MAP_METAL_FLOAT_BUILTIN2(fmin)
-ACPP_SSCP_MAP_METAL_FLOAT_BUILTIN2(fmax)
+// fmin/fmax: IEEE 754-2008 NaN + signed-zero semantics. Defined explicitly
+// below (not via ACPP_SSCP_MAP_METAL_FLOAT_BUILTIN2) — MSL's native fmin/fmax
+// under -ffast-math treat -0 == +0 and may drop the NaN guard, so the macro
+// passthrough would lose both contracts at the call site.
+HIPSYCL_SSCP_BUILTIN i32 __acpp_sscp_isnan_f32(f32 x);
+HIPSYCL_SSCP_BUILTIN i32 __acpp_sscp_signbit_f32(f32 x);
+HIPSYCL_SSCP_BUILTIN f32 __acpp_sscp_fmin_f32(f32 x, f32 y) {
+  if (__acpp_sscp_isnan_f32(x)) return y;
+  if (__acpp_sscp_isnan_f32(y)) return x;
+  if (x == 0.0f && y == 0.0f) {
+    return __acpp_sscp_signbit_f32(x) ? x : y;
+  }
+  return __acpp_sscp_metal_math_f32_f32_f32("fmin", x, y);
+}
+HIPSYCL_SSCP_BUILTIN f32 __acpp_sscp_fmax_f32(f32 x, f32 y) {
+  if (__acpp_sscp_isnan_f32(x)) return y;
+  if (__acpp_sscp_isnan_f32(y)) return x;
+  if (x == 0.0f && y == 0.0f) {
+    return __acpp_sscp_signbit_f32(x) ? y : x;
+  }
+  return __acpp_sscp_metal_math_f32_f32_f32("fmax", x, y);
+}
 ACPP_SSCP_MAP_METAL_FLOAT_BUILTIN2(fmod)
 ACPP_SSCP_MAP_METAL_FLOAT_BUILTIN2(fdim)
 ACPP_SSCP_MAP_METAL_FLOAT_BUILTIN2(pow)

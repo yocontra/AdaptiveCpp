@@ -1496,11 +1496,18 @@ bool MetalEmitter::emitCallInstruction(const CallInst* CI, const std::string& na
     else if (calleeName == "__acpp_sscp_fmax_f64") { is_f64 = true; }
 
     if (is_f32) {
+      // Defensive NaN-propagating sequence for any __acpp_sscp_fmin_f32 /
+      // __acpp_sscp_fmax_f32 call that survives inlining (the libkernel body
+      // in math.cpp already supplies IEEE 754-2008 NaN + signed-zero
+      // semantics and is always_inline, so in practice this branch is
+      // unreachable — kept as a safety net).
       std::string a = emitExpr(CI->getArgOperand(0));
       std::string b = emitExpr(CI->getArgOperand(1));
-      os << indent(level) << name << " = (isnan(" << a << ") ? (" << b
-         << ") : (isnan(" << b << ") ? (" << a << ") : " << msl_op
-         << "(" << a << ", " << b << "))); // " << instToString(*CI) << "\n";
+      os << indent(level) << name << " = ("
+         << "isnan(" << a << ") ? (" << b << ") : "
+         << "isnan(" << b << ") ? (" << a << ") : " << msl_op << "(" << a
+         << ", " << b << ")"
+         << "); // " << instToString(*CI) << "\n";
       return true;
     }
     if (is_f64) {
