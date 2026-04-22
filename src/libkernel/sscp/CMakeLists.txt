@@ -35,11 +35,20 @@ function(libkernel_generate_bitcode_library)
     set(target_flag -target ${triple})
   endif()
 
+  # Absolute paths (e.g. from an external dep glob) pass through unmodified;
+  # relative names are resolved against the current source dir, matching the
+  # historical per-backend usage.
+  if(IS_ABSOLUTE "${source}")
+    set(resolved_source "${source}")
+  else()
+    set(resolved_source "${CMAKE_CURRENT_SOURCE_DIR}/${source}")
+  endif()
+
   add_custom_command(
       OUTPUT ${target_output_file}
       COMMAND ${CLANG_EXECUTABLE_PATH} ${target_flag} -fno-exceptions -fno-rtti -O3 -emit-llvm -std=c++17 -DHIPSYCL_SSCP_LIBKERNEL_LIBRARY
-                    -I ${HIPSYCL_SOURCE_DIR}/include ${additional} ${platform_specific} -o ${target_output_file} -c ${CMAKE_CURRENT_SOURCE_DIR}/${source}
-      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${source} ${target_depends}
+                    -I ${HIPSYCL_SOURCE_DIR}/include ${additional} ${platform_specific} -o ${target_output_file} -c ${resolved_source}
+      DEPENDS ${resolved_source} ${target_depends}
       VERBATIM)
 
   install(FILES ${target_output_file} DESTINATION lib/hipSYCL/bitcode)

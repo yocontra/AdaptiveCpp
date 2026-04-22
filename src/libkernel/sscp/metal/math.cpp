@@ -357,17 +357,18 @@ ACPP_SSCP_MAP_METAL_HALF_BINOP(div, /)
 // Each stub below is declared so the linker is satisfied. Bodies call
 // __builtin_trap() because the vendored metal-float64 library at
 // ./float64/ has no actual soft-double arithmetic — upstream was abandoned
-// in 2023 after only shipping the `float64_t` skeleton class. See
-// ./float64/MAINTENANCE.md for the wire-up plan when an implementation
-// becomes available.
+// in 2023 after only shipping the `float64_t` skeleton class.
 //
-// Once a real soft-double implementation lives under ./float64/, swap
-// individual bodies from `__builtin_trap()` to the real call. The set of
-// declared symbols must not shrink — LLVMToMetal.cpp emits every one
-// unconditionally.
-//
-// TODO(acpp-soft-fp64): wire each body to metal-float64 impl once available.
+// When an external soft-fp64 implementation is linked in via
+// ACPP_METAL_EXTERNAL_FP64_DIR, the build defines
+// ACPP_HAS_EXTERNAL_SOFT_FP64 and the entire f64 trap-stub block is
+// elided — the real bodies come from the external TUs and `llvm-link`
+// sees exactly one definition per symbol. Without the guard, duplicate
+// definitions would error out `llvm-link` at libkernel-bitcode link.
+// See ./float64/README.md for the ABI contract.
 // ============================================================================
+
+#ifndef ACPP_HAS_EXTERNAL_SOFT_FP64
 
 #define ACPP_SSCP_F64_TRAP_STUB1(name) \
   HIPSYCL_SSCP_BUILTIN double __acpp_sscp_##name##_f64(double) { \
@@ -500,3 +501,5 @@ HIPSYCL_SSCP_BUILTIN __acpp_int32 __acpp_sscp_isnormal_f64(double) {
 HIPSYCL_SSCP_BUILTIN __acpp_int32 __acpp_sscp_signbit_f64(double) {
   __builtin_trap();
 }
+
+#endif // ACPP_HAS_EXTERNAL_SOFT_FP64
