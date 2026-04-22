@@ -251,6 +251,12 @@ constant long& constant __acpp_sscp_metal_gpu_to_host_addr_diff [[buffer(1)]];
 
 )__";
 
+  // Emit the soft-fp64 helper types (acpp_f64, i48u) BEFORE LLVM struct
+  // emission. LLVM aggregate types that contain an fp64 field (e.g.
+  // `{ double, double, i64 }`) get emitted with `acpp_f64` as the field
+  // type by `emitTypes()`, so the struct must be declared first or Metal
+  // compilation rejects the shader with "unknown type name 'acpp_f64'".
+  emitEarlyFp64Helpers();
   emitTypes();
   emitIntrinsicHelpers();
   emitGlobalConstants();
@@ -410,57 +416,24 @@ void MetalEmitter::emitTypes() {
   }
 }
 
-void MetalEmitter::emitIntrinsicHelpers() {
-  for (Function& F : M) {
-    if (F.isDeclaration()) {
-      continue;
-    }
-    for (const BasicBlock& BB : F) {
-      for (const Instruction& I : BB) {
-        if (!I.getType()->isVoidTy()) {
-          // mark used type-helpers
-          mapType(I.getType());
-        }
-      }
-    }
-  }
-
-  os << R"__(
-  inline char __as_signed(uchar value) {
-    return as_type<char>(value);
-  }
-
-  inline short __as_signed(ushort value) {
-    return as_type<short>(value);
-  }
-
-  inline int __as_signed(uint value) {
-    return as_type<int>(value);
-  }
-
-  inline long __as_signed(ulong value) {
-    return as_type<long>(value);
-  }
-
-  // LLVM sext i1 true to iN yields all-ones (-1), so replicate that semantic
-  inline int __as_signed(bool value) {
-    return value ? -1 : 0;
-  }
-)__";
-
-  // Change 2: soft-double fp64 representation. Metal GPUs don't natively
-  // support fp64, so we lower every LLVM `double` op to a call into the
-  // __acpp_sscp_soft_f64_* library (provided by the libkernel agent).
-  // Storage representation: two uint halves to sidestep MSL alignment
-  // quirks on ulong (and keep the struct trivially memcpy-able).
+void MetalEmitter::emitEarlyFp64Helpers() {
+  // Soft-double fp64 representation. Metal GPUs don't natively support
+  // fp64, so we lower every LLVM `double` op to a call into the
+  // __acpp_sscp_soft_f64_* library. Storage: two uint halves to sidestep
+  // MSL alignment quirks on ulong and keep the struct trivially
+  // memcpy-able.
+  //
+  // Emitted BEFORE emitTypes() so that LLVM struct types containing an
+  // fp64 field (emitted with `acpp_f64` field type) can reference this
+  // declaration. Also emits the `i48u` helper (used by the soft-fp64
+  // library bodies themselves) so it's available before the Emitter's
+  // topological-sort loop emits the soft-fp64 function definitions.
   os << R"__(
 struct acpp_f64 {
   uint lo;
   uint hi;
 };
-)__";
 
-  os << R"__(
 struct i48u {
   packed_ushort3 w;
   i48u() : w(packed_ushort3(0,0,0)) {}
@@ -513,6 +486,46 @@ struct i48u {
     return (ulong)w[0] | ((ulong)w[1] << 16) | ((ulong)w[2] << 32);
   }
 };
+)__";
+  os << "\n";
+}
+
+void MetalEmitter::emitIntrinsicHelpers() {
+  for (Function& F : M) {
+    if (F.isDeclaration()) {
+      continue;
+    }
+    for (const BasicBlock& BB : F) {
+      for (const Instruction& I : BB) {
+        if (!I.getType()->isVoidTy()) {
+          // mark used type-helpers
+          mapType(I.getType());
+        }
+      }
+    }
+  }
+
+  os << R"__(
+  inline char __as_signed(uchar value) {
+    return as_type<char>(value);
+  }
+
+  inline short __as_signed(ushort value) {
+    return as_type<short>(value);
+  }
+
+  inline int __as_signed(uint value) {
+    return as_type<int>(value);
+  }
+
+  inline long __as_signed(ulong value) {
+    return as_type<long>(value);
+  }
+
+  // LLVM sext i1 true to iN yields all-ones (-1), so replicate that semantic
+  inline int __as_signed(bool value) {
+    return value ? -1 : 0;
+  }
 )__";
 
   os << "\n";

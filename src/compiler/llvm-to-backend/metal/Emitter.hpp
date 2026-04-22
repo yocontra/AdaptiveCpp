@@ -56,6 +56,7 @@ public:
 
 private:
   bool emitFunction(llvm::Function& F, const hl::Node& node);
+  void emitEarlyFp64Helpers();
   void emitTypes();
   void emitIntrinsicHelpers();
   void emitGlobalConstants();
