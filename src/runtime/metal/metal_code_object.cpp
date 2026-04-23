@@ -111,7 +111,9 @@ std::string compile_msl_to_metallib(const std::string &source,
     return {};
   }
 
-  std::remove(metal_path.c_str());
+  if (std::getenv("ACPP_METAL_KEEP_SOURCE") == nullptr) {
+    std::remove(metal_path.c_str());
+  }
   std::remove(air_path.c_str());
 
   HIPSYCL_DEBUG_INFO

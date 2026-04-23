@@ -54,6 +54,7 @@
 #include "llvm/Transforms/Scalar/DCE.h"
 #include "llvm/Transforms/Scalar/ADCE.h"
 #include <llvm/Transforms/IPO/AlwaysInliner.h>
+#include <llvm/Transforms/Utils/ModuleUtils.h>
 
 #include <memory>
 #include <cassert>
@@ -497,16 +498,169 @@ bool LLVMToMetalTranslator::toBackendFlavor(llvm::Module &M, PassHandler& PH) {
   // the base class O3 optimization pipeline, which may re-introduce LLVM intrinsics such as
   // llvm.minnum / llvm.maxnum / llvm.fmuladd via InstCombine. Those are handled in
   // translateToBackendFormat with a second ReplaceIntrinsics + link pass.
+  // Pre-link soft-fp64 anchor. The MetalEmitter translates IR-level fp64
+  // instructions (fadd/fsub/fmul/fdiv/frem/fneg/fcmp, fp-int conversions)
+  // to source-level call strings like `__acpp_sscp_soft_f64_add(...)`.
+  // Those emissions bypass the LLVM callgraph: the IR has no `call`
+  // instruction referencing those symbols. Consequences without
+  // intervention:
+  //   * `LinkOnlyNeeded=true` (the default) doesn't pull the soft-fp64
+  //     bodies into M — nothing "needs" them from M's perspective.
+  //   * Even if we force-link, GlobalInliningAttributorPass marks every
+  //     non-kernel function as `alwaysinline`+InternalLinkage; the
+  //     inliner finds no call sites; and O3 DCE removes the bodies.
+  // Either way, the Emitter emits calls to symbols with no definitions
+  // and Metal compilation fails with "undeclared identifier".
+  //
+  // Fix (two-step):
+  //   (a) BEFORE the link, declare every `__acpp_sscp_soft_f64_*`
+  //       primitive the Emitter may reference and append each to
+  //       `@llvm.compiler.used`. That anchors the symbols as "needed"
+  //       so `LinkOnlyNeeded=true` pulls in their bodies.
+  //   (b) AFTER the link, mark every `__acpp_sscp_soft_f64_*` and
+  //       `__acpp_sscp_*_f64` function `noinline` + strip
+  //       `alwaysinline`, re-anchor in `@llvm.compiler.used`, and keep
+  //       external linkage. This survives GlobalInliningAttributorPass
+  //       (which now respects `noinline`) and O3 DCE. The MetalEmitter's
+  //       topological-sort loop then emits each body as a Metal helper
+  //       function ahead of the kernel.
+  //
+  // Pairs with CMake change: `-fno-vectorize -fno-slp-vectorize
+  // -fno-unroll-loops` on the libkernel bitcode compile when the
+  // external soft-fp64 is active, so the resulting bodies don't contain
+  // `<N x double>` or `<4 x i32>` ops the Emitter can't translate.
+  {
+    static const struct { const char* name; const char* sig; } kSoftF64Primitives[] = {
+      {"__acpp_sscp_soft_f64_add", "ddd"},
+      {"__acpp_sscp_soft_f64_sub", "ddd"},
+      {"__acpp_sscp_soft_f64_mul", "ddd"},
+      {"__acpp_sscp_soft_f64_div", "ddd"},
+      {"__acpp_sscp_soft_f64_rem", "ddd"},
+      {"__acpp_sscp_soft_f64_neg", "dd"},
+      {"__acpp_sscp_soft_f64_fcmp", "bddi"},
+      {"__acpp_sscp_soft_f64_fmin_precise", "ddd"},
+      {"__acpp_sscp_soft_f64_fmax_precise", "ddd"},
+      {"__acpp_sscp_soft_f64_from_f32", "df"},
+      {"__acpp_sscp_soft_f64_to_f32",   "fd"},
+      {"__acpp_sscp_soft_f64_from_i32", "di"},
+      {"__acpp_sscp_soft_f64_from_i64", "dI"},
+      {"__acpp_sscp_soft_f64_from_u32", "du"},
+      {"__acpp_sscp_soft_f64_from_u64", "dU"},
+      {"__acpp_sscp_soft_f64_to_i32",   "id"},
+      {"__acpp_sscp_soft_f64_to_i64",   "Id"},
+      {"__acpp_sscp_soft_f64_to_u32",   "ud"},
+      {"__acpp_sscp_soft_f64_to_u64",   "Ud"},
+    };
+    auto typeFromCode = [&](char c) -> llvm::Type* {
+      auto& Ctx = M.getContext();
+      switch (c) {
+        case 'd': return llvm::Type::getDoubleTy(Ctx);
+        case 'f': return llvm::Type::getFloatTy(Ctx);
+        case 'i': case 'u': return llvm::Type::getInt32Ty(Ctx);
+        case 'I': case 'U': return llvm::Type::getInt64Ty(Ctx);
+        case 'b': return llvm::Type::getInt1Ty(Ctx);
+        default: return nullptr;
+      }
+    };
+    llvm::SmallVector<llvm::GlobalValue*, 32> PreLinkUsed;
+    for (const auto& prim : kSoftF64Primitives) {
+      llvm::Type* retTy = typeFromCode(prim.sig[0]);
+      if (!retTy) continue;
+      llvm::SmallVector<llvm::Type*, 4> argTys;
+      for (const char* p = prim.sig + 1; *p; ++p)
+        if (auto* t = typeFromCode(*p)) argTys.push_back(t);
+      auto* FT = llvm::FunctionType::get(retTy, argTys, false);
+      auto Callee = M.getOrInsertFunction(prim.name, FT);
+      if (auto* F = llvm::dyn_cast<llvm::Function>(Callee.getCallee()))
+        PreLinkUsed.push_back(F);
+    }
+    if (!PreLinkUsed.empty())
+      llvm::appendToCompilerUsed(M, PreLinkUsed);
+  }
+
   std::string BuiltinBitcodeFile =
       common::filesystem::join_path(getBitcodePath(), "libkernel-sscp-metal-full.bc");
   if (!this->linkBitcodeFile(M, BuiltinBitcodeFile))
     return false;
+
+  // Post-link preservation. The bodies pulled in above must survive
+  // `GlobalInliningAttributorPass` (which now skips `noinline` per the
+  // same commit) and O3 DCE, so the MetalEmitter sees them.
+  llvm::SmallVector<llvm::GlobalValue*, 64> SoftF64Funcs;
+  for (llvm::Function& F : M) {
+    if (F.isDeclaration()) continue;
+    llvm::StringRef Name = F.getName();
+    bool isSoftF64Primitive = Name.find("__acpp_sscp_soft_f64_") == 0;
+    bool isF64MathForwarder =
+        Name.find("__acpp_sscp_") == 0 &&
+        (Name.ends_with("_f64") || Name.ends_with("_f64_precise"));
+    // `sf64_*` are the core soft-fp64 bodies these forwarders call into.
+    // Preserve them too: O3's InstCombine pattern-matches their bit-
+    // twiddle implementations back into LLVM intrinsics (e.g. the
+    // `(x & ~sign) | (y & sign)` copysign pattern → `llvm.copysign.f64`
+    // → `__acpp_sscp_copysign_f64`), creating a self-call loop.
+    bool isSoftF64Core = Name.find("sf64_") == 0;
+    if (!isSoftF64Primitive && !isF64MathForwarder && !isSoftF64Core) continue;
+    if (!F.hasFnAttribute(llvm::Attribute::NoInline))
+      F.addFnAttr(llvm::Attribute::NoInline);
+    F.removeFnAttr(llvm::Attribute::AlwaysInline);
+    // `optnone` stops the O3 pipeline from pattern-matching bit-twiddle
+    // soft-fp64 bodies back into LLVM intrinsics. Specifically: without
+    // this, InstCombine recognises `sf64_copysign`'s `(x & ~sign) |
+    // (y & sign)` pattern as `llvm.copysign.f64`, ReplaceIntrinsics
+    // then remaps that to `__acpp_sscp_copysign_f64`, and the body ends
+    // up calling its own forwarder. The soft-fp64 bodies are already
+    // hand-optimised for correctness; further optimisation is unwanted.
+    if (!F.hasFnAttribute(llvm::Attribute::OptimizeNone))
+      F.addFnAttr(llvm::Attribute::OptimizeNone);
+    if (F.getLinkage() == llvm::GlobalValue::InternalLinkage)
+      F.setLinkage(llvm::GlobalValue::ExternalLinkage);
+    SoftF64Funcs.push_back(&F);
+  }
+  if (!SoftF64Funcs.empty()) {
+    llvm::appendToCompilerUsed(M, SoftF64Funcs);
+    HIPSYCL_DEBUG_INFO
+        << "LLVMToMetal: preserved " << SoftF64Funcs.size()
+        << " soft-fp64 function bodies for MetalEmitter source emission\n";
+  }
 
   AddressSpaceInferencePass ASIPass{ASMap};
   ASIPass.run(M, *PH.ModuleAnalysisManager);
 
   llvm::StripDebugInfo(M);
 
+  return true;
+}
+
+bool LLVMToMetalTranslator::optimizeFlavoredIR(llvm::Module& M, PassHandler& PH) {
+  // Metal-specific override: run the O3 pipeline with loop + SLP
+  // vectorizers disabled, and interleaving turned off. The default
+  // pipeline introduces `<N x T>` vector ops (especially `<4 x i32>`
+  // shifts with non-{32,64,96} amounts, `<2 x double>` SLP bundles, and
+  // `insertelement`/`shufflevector`) that the MetalEmitter cannot lower
+  // to MSL. Keeping the soft-fp64 bodies scalar through the whole
+  // optimization pipeline is what makes the external-fp64 integration
+  // actually work end-to-end.
+  HIPSYCL_DEBUG_INFO << "LLVMToMetal::optimizeFlavoredIR: O3 with vectorization disabled\n";
+  llvm::PipelineTuningOptions PTO;
+  PTO.LoopVectorization = false;
+  PTO.SLPVectorization = false;
+  PTO.LoopInterleaving = false;
+
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  llvm::PassBuilder PB(nullptr, PTO);
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+  llvm::ModulePassManager MPM =
+      PB.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O3);
+  MPM.run(M, MAM);
   return true;
 }
 
@@ -531,6 +685,17 @@ bool LLVMToMetalTranslator::translateToBackendFormat(llvm::Module& FlavoredModul
       return false;
 
     llvm::AlwaysInlinerPass{}.run(FlavoredModule, MAM);
+
+    // Third ReplaceIntrinsics pass: the AlwaysInliner above inlines
+    // soft-fp64 bodies from the just-linked libkernel. Those bodies use
+    // LLVM intrinsics like `llvm.copysign.f64`, `llvm.fabs.f64`, etc.
+    // that would otherwise survive to MetalEmitter and be written as
+    // literal `llvm.copysign.f64(...)` calls, which Metal compilation
+    // rejects ("undeclared identifier 'llvm'"). Re-run the remap so the
+    // inlined intrinsic call sites point at `__acpp_sscp_*_f64` names,
+    // and the bodies of those `__acpp_sscp_*_f64` forwarders (which the
+    // soft-fp64 preservation pass keeps alive) get emitted.
+    ReplaceIntrinsics{}.run(FlavoredModule, MAM);
 
     llvm::FunctionPassManager FPM;
     FPM.addPass(llvm::PromotePass());
@@ -561,6 +726,14 @@ bool LLVMToMetalTranslator::translateToBackendFormat(llvm::Module& FlavoredModul
 
   if (getenv("__ACPP_PRINT_IR_BEFORE_EMIT")) {
     FlavoredModule.print(llvm::errs(), nullptr);
+  }
+#ifdef ACPP_PRINT_IR_BEFORE_EMIT
+  FlavoredModule.print(llvm::errs(), nullptr);
+#endif
+  if (const char* dump = std::getenv("ACPP_METAL_DUMP_IR")) {
+    std::error_code ec;
+    llvm::raw_fd_ostream f(dump, ec);
+    if (!ec) FlavoredModule.print(f, nullptr);
   }
 
   MetalEmitterOptions emitterOpts;

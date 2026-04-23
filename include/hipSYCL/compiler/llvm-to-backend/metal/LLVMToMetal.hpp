@@ -35,6 +35,13 @@ protected:
   // Transform LLVM IR as much as required to backend-specific flavor
   virtual bool toBackendFlavor(llvm::Module &M, PassHandler& PH) override;
   virtual bool translateToBackendFormat(llvm::Module& FlavoredModule, std::string& out) override;
+  // Metal-specific O3 pipeline with LLVM vectorizers disabled. The Metal
+  // MSL source emitter cannot lower `<N x T>` vector ops with non-32-bit
+  // shift amounts or arbitrary `insertelement` / `shufflevector` into
+  // MSL, which the default O3 pipeline introduces (loop vectorizer + SLP
+  // vectorizer). Keeping the soft-fp64 bodies scalar is load-bearing for
+  // the external-fp64 integration path.
+  virtual bool optimizeFlavoredIR(llvm::Module& M, PassHandler& PH) override;
 
   // Transfers kernel properties (e.g. kernel call conventions, additional metadata) from one kernel
   // "From" to another "To". This is useful e.g. for dead argument elimination, where a new

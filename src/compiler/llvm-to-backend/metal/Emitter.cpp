@@ -264,6 +264,27 @@ constant long& constant __acpp_sscp_metal_gpu_to_host_addr_diff [[buffer(1)]];
   auto callGraph = buildCallGraph();
   auto sortedFunctions = topologicalSort(callGraph);
 
+  // Emit forward declarations for every non-kernel function before any
+  // bodies. InstCombine (during the libkernel bitcode build at -O3) can
+  // pattern-match soft-fp64 bit-twiddle bodies into calls to LLVM
+  // intrinsics, which ReplaceIntrinsics then remaps to `__acpp_sscp_*_f64`
+  // — producing mutual references like `sf64_copysign` calling
+  // `__acpp_sscp_copysign_f64` calling `sf64_copysign`. Topological sort
+  // can't pick an order that satisfies such cycles, so MSL refuses to
+  // compile on "use before declaration". Forward decls break the cycle.
+  for (Function* F : sortedFunctions) {
+    if (kernelNames.count(F->getName().str()) > 0) continue;
+    os << mapType(F->getReturnType()) << " " << F->getName().str() << " (";
+    bool first = true;
+    for (Argument& A : F->args()) {
+      if (!first) os << ", ";
+      first = false;
+      os << mapType(A.getType()) << " " << valueName(&A);
+    }
+    os << ");\n";
+  }
+  os << "\n";
+
   for (Function* F : sortedFunctions) {
     HLExtractionPass hlPass;
     hlPass.run(*F, FAM);
@@ -764,7 +785,20 @@ bool MetalEmitter::emitBasicBlock(const BasicBlock* BB, int level) {
       if (!isa<UndefValue>(V) && !isa<PoisonValue>(V)) {
         os << indent(level) << valueName(PHI) << "_in = " << emitExpr(V) << ";\n";
       } else {
-        os << indent(level) << valueName(PHI) << "_in = /* undef */ 0;\n";
+        // For aggregate / non-scalar types the integer literal `0` is
+        // not assignable — MSL needs a type-compatible placeholder.
+        // Use `{}` for structs/vectors, `0` for scalar integers,
+        // `0.0` for float/acpp_f64 is wrong too; any constant is fine
+        // because "undef" means we must not depend on the value.
+        std::string ty = mapType(PHI->getType());
+        if (ty == "acpp_f64") {
+          os << indent(level) << valueName(PHI) << "_in = acpp_f64{0u, 0u};\n";
+        } else if (PHI->getType()->isAggregateType() ||
+                   PHI->getType()->isVectorTy()) {
+          os << indent(level) << valueName(PHI) << "_in = " << ty << "{};\n";
+        } else {
+          os << indent(level) << valueName(PHI) << "_in = /* undef */ 0;\n";
+        }
       }
     }
   }
@@ -1211,18 +1245,40 @@ void MetalEmitter::emitBinaryOperator(const BinaryOperator* BO, const std::strin
 
     case Instruction::Shl:
       if (resultType == "uint4") {
-        // TODO: track >> + trunc for performance
-        auto _x = lhs + ".x";
-        auto _y = lhs + ".y";
-        auto _z = lhs + ".z";
-        if (rhs == "0x20u") {
-          os << indent(level) << name << " = uint4(0," << _x << "," << _y << "," << _z << "); //" << instToString(*BO) << "\n";
-        } else if (rhs == "0x40u") {
-          os << indent(level) << name << " = uint4(0,0," << _x << "," << _y << "); //" << instToString(*BO) << "\n";
-        } else if (rhs == "0x60u") {
-          os << indent(level) << name << " = uint4(0,0,0," << _x << "); //" << instToString(*BO) << "\n";
+        // uint4 is the Metal lowering of LLVM `i128`. Lanes hold the
+        // 128-bit value in little-endian 32-bit words: x = bits [0..31],
+        // y = [32..63], z = [64..95], w = [96..127].
+        // For constant shift amounts we emit a specialised expression
+        // (the soft-fp64 library shifts by 9/23/55/etc. inside fma).
+        if (auto* CIrhs = llvm::dyn_cast<llvm::ConstantInt>(BO->getOperand(1))) {
+          uint64_t shift = CIrhs->getZExtValue() & 127u;
+          uint64_t wordShift = shift / 32;
+          uint64_t bitShift  = shift % 32;
+          auto lane = [&](int i) -> std::string {
+            static const char* kNames[4] = {".x", ".y", ".z", ".w"};
+            return lhs + kNames[i];
+          };
+          auto zero = std::string{"0u"};
+          std::string lanes[4];
+          for (int i = 0; i < 4; ++i) {
+            int srcHi = i - static_cast<int>(wordShift);
+            int srcLo = srcHi - 1;
+            std::string hi = (srcHi >= 0 && srcHi < 4) ? lane(srcHi) : zero;
+            std::string lo = (srcLo >= 0 && srcLo < 4) ? lane(srcLo) : zero;
+            if (bitShift == 0) {
+              lanes[i] = hi;
+            } else {
+              // (src[hi] << bitShift) | (src[lo] >> (32 - bitShift))
+              lanes[i] = "((" + hi + " << " + std::to_string(bitShift) +
+                         "u) | (" + lo + " >> " +
+                         std::to_string(32u - bitShift) + "u))";
+            }
+          }
+          os << indent(level) << name << " = uint4(" << lanes[0] << ","
+             << lanes[1] << "," << lanes[2] << "," << lanes[3] << "); // "
+             << instToString(*BO) << "\n";
         } else {
-          errorMsg = "ERROR: Unsupported uint4 shift left amount: " + rhs;
+          errorMsg = "ERROR: uint4 Shl with non-constant shift amount: " + rhs;
         }
       } else {
         os << indent(level) << name << " = " << lhs << " << " << rhs << ";\n";
@@ -1234,18 +1290,39 @@ void MetalEmitter::emitBinaryOperator(const BinaryOperator* BO, const std::strin
 
     case Instruction::LShr:
       if (resultType == "uint4") {
-        // TODO: track >> + trunc for performance
-        auto _y = lhs + ".y";
-        auto _z = lhs + ".z";
-        auto _w = lhs + ".w";
-        if (rhs == "0x20u") {
-          os << indent(level) << name << " = uint4(" << _y << "," << _z << "," << _w << ",0); // " << instToString(*BO) << "\n";
-        } else if (rhs == "0x40u") {
-          os << indent(level) << name << " = uint4(" << _z << "," << _w << ",0,0); // " << instToString(*BO) << "\n";
-        } else if (rhs == "0x60u") {
-          os << indent(level) << name << " = uint4(" << _w << ",0,0,0); // " << instToString(*BO) << "\n";
+        // i128 logical right shift. Lanes are little-endian 32-bit
+        // words (see Shl above). For lane `i` the result is built from
+        // `src[i + wordShift]` (low word) and `src[i + wordShift + 1]`
+        // (high word), combined via `bitShift`.
+        if (auto* CIrhs = llvm::dyn_cast<llvm::ConstantInt>(BO->getOperand(1))) {
+          uint64_t shift = CIrhs->getZExtValue() & 127u;
+          uint64_t wordShift = shift / 32;
+          uint64_t bitShift  = shift % 32;
+          auto lane = [&](int i) -> std::string {
+            static const char* kNames[4] = {".x", ".y", ".z", ".w"};
+            return lhs + kNames[i];
+          };
+          auto zero = std::string{"0u"};
+          std::string lanes[4];
+          for (int i = 0; i < 4; ++i) {
+            int srcLo = i + static_cast<int>(wordShift);
+            int srcHi = srcLo + 1;
+            std::string lo = (srcLo >= 0 && srcLo < 4) ? lane(srcLo) : zero;
+            std::string hi = (srcHi >= 0 && srcHi < 4) ? lane(srcHi) : zero;
+            if (bitShift == 0) {
+              lanes[i] = lo;
+            } else {
+              // (src[lo] >> bitShift) | (src[hi] << (32 - bitShift))
+              lanes[i] = "((" + lo + " >> " + std::to_string(bitShift) +
+                         "u) | (" + hi + " << " +
+                         std::to_string(32u - bitShift) + "u))";
+            }
+          }
+          os << indent(level) << name << " = uint4(" << lanes[0] << ","
+             << lanes[1] << "," << lanes[2] << "," << lanes[3] << "); // "
+             << instToString(*BO) << "\n";
         } else {
-          errorMsg = "ERROR: Unsupported uint4 logical right shift amount: " + rhs;
+          errorMsg = "ERROR: uint4 LShr with non-constant shift amount: " + rhs;
         }
       } else {
         os << indent(level) << name << " = " << lhs << " >> " << rhs << ";\n";
