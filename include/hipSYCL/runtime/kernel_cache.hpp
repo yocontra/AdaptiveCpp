@@ -320,14 +320,29 @@ public:
     }
     HIPSYCL_DEBUG_INFO << "kernel_cache: Cache MISS for id "
                       << kernel_configuration::to_string(id_of_code_object) << "\n";
-    
+
     std::string compiled_binary;
     // TODO: We might want to allow JIT compilation in parallel at some point
     std::lock_guard<std::mutex> lock{_mutex};
 
+    // Fast-fail if a prior dispatch already observed a structural failure for
+    // this binary. Poison is keyed by id_of_binary (device-independent) and
+    // survives backend resets because a broken emitter / MSL compile is a
+    // property of the binary itself, not of any backend handle.
+    if(auto it = _poisoned_jit_ids.find(id_of_binary);
+       it != _poisoned_jit_ids.end()) {
+      HIPSYCL_DEBUG_WARNING
+          << "kernel_cache: Fast-failing poisoned binary id "
+          << kernel_configuration::to_string(id_of_binary)
+          << " — prior failure: " << it->second << std::endl;
+      return nullptr;
+    }
+
     if(!persistent_cache_lookup(id_of_binary, compiled_binary)){
-      if(!jit_compile(compiled_binary))
+      if(!jit_compile(compiled_binary)) {
+        _poisoned_jit_ids[id_of_binary] = "JIT compilation failed";
         return nullptr;
+      }
 
       if(_is_first_jit_compilation) {
         _is_first_jit_compilation = false;
@@ -341,11 +356,14 @@ public:
       }
       persistent_cache_store(id_of_binary, compiled_binary);
     }
-    
+
     const code_object* new_object = c(compiled_binary);
-    if(new_object)
+    if(new_object) {
       _code_objects[id_of_code_object] = code_object_ptr{new_object};
-    
+    } else {
+      _poisoned_jit_ids[id_of_binary] = "Code object construction failed";
+    }
+
     return new_object;
   }
 
@@ -394,7 +412,16 @@ private:
 
   ankerl::unordered_dense::map<code_object_id, code_object_ptr, rt::kernel_id_hash>
       _code_objects;
-  
+
+  // Binary ids whose JIT compile or code-object construction failed in this
+  // process. Structural failures are deterministic: re-running jit_compile or
+  // c() on the same id would reproduce the failure while burning the full
+  // JIT / MSL-compile cost (observed as 5+ minute 99% CPU hangs on Metal when
+  // MTLCompilerService is invoked repeatedly via the XPC retry helper).
+  // Value is a human-readable reason surfaced via HIPSYCL_DEBUG_WARNING.
+  ankerl::unordered_dense::map<code_object_id, std::string, rt::kernel_id_hash>
+      _poisoned_jit_ids;
+
   bool _is_first_jit_compilation = true;
 };
 
