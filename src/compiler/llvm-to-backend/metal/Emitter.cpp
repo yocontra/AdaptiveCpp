@@ -1356,39 +1356,66 @@ void MetalEmitter::emitICmpInstruction(const ICmpInst* IC, const std::string& na
 
   auto resultType = mapType(IC->getType());
 
+  // Change 2: i128 lowers to `uint4` via mapType (4x uint32). MSL vector-
+  // scalar comparison is component-wise and returns `bool4`, but LLVM's
+  // icmp mandates a scalar `i1` result — reduce via all()/any() for eq/ne.
+  // Ordered (unsigned/signed lt/gt/le/ge) comparisons on i128 require a
+  // proper big-integer comparator and are not emitted by the soft-fp64
+  // prelude in practice; report as unsupported rather than silently emit
+  // a component-wise compare that would collapse to `(bool4,bool4)→bool4`.
+  Type *opTy = IC->getOperand(0)->getType();
+  bool isI128 = opTy->isIntegerTy(128);
+
   switch (IC->getPredicate()) {
     case ICmpInst::ICMP_EQ:
-      os << indent(level) << name << " = (" << lhs << " == " << rhs << ");\n";
+      if (isI128) {
+        os << indent(level) << name << " = all(" << lhs << " == " << rhs << ");\n";
+      } else {
+        os << indent(level) << name << " = (" << lhs << " == " << rhs << ");\n";
+      }
       break;
     case ICmpInst::ICMP_NE:
-      os << indent(level) << name << " = (" << lhs << " != " << rhs << ");\n";
+      if (isI128) {
+        os << indent(level) << name << " = any(" << lhs << " != " << rhs << ");\n";
+      } else {
+        os << indent(level) << name << " = (" << lhs << " != " << rhs << ");\n";
+      }
       break;
     case ICmpInst::ICMP_UGT:
-      os << indent(level) << name << " = (" << lhs << " > " << rhs << ");\n";
-      break;
     case ICmpInst::ICMP_UGE:
-      os << indent(level) << name << " = (" << lhs << " >= " << rhs << ");\n";
-      break;
     case ICmpInst::ICMP_ULT:
-      os << indent(level) << name << " = (" << lhs << " < " << rhs << ");\n";
-      break;
     case ICmpInst::ICMP_ULE:
-      os << indent(level) << name << " = (" << lhs << " <= " << rhs << ");\n";
-      break;
-
-    // signed variants
     case ICmpInst::ICMP_SGT:
-      os << indent(level) << name << " = ((__as_signed(" << lhs << ")) > (__as_signed(" << rhs << ")));\n";
-      break;
     case ICmpInst::ICMP_SGE:
-      os << indent(level) << name << " = ((__as_signed(" << lhs << ")) >= (__as_signed(" << rhs << ")));\n";
-      break;
     case ICmpInst::ICMP_SLT:
-      os << indent(level) << name << " = ((__as_signed(" << lhs << ")) < (__as_signed(" << rhs << ")));\n";
+    case ICmpInst::ICMP_SLE: {
+      if (isI128) {
+        errorMsg = "Ordered icmp on i128 is not supported by the Metal "
+                   "emitter (would need a big-integer comparator).";
+        return;
+      }
+      const char *op = nullptr;
+      bool isSigned = false;
+      switch (IC->getPredicate()) {
+        case ICmpInst::ICMP_UGT: op = ">"; break;
+        case ICmpInst::ICMP_UGE: op = ">="; break;
+        case ICmpInst::ICMP_ULT: op = "<"; break;
+        case ICmpInst::ICMP_ULE: op = "<="; break;
+        case ICmpInst::ICMP_SGT: op = ">"; isSigned = true; break;
+        case ICmpInst::ICMP_SGE: op = ">="; isSigned = true; break;
+        case ICmpInst::ICMP_SLT: op = "<"; isSigned = true; break;
+        case ICmpInst::ICMP_SLE: op = "<="; isSigned = true; break;
+        default: break;
+      }
+      if (isSigned) {
+        os << indent(level) << name << " = ((__as_signed(" << lhs << ")) "
+           << op << " (__as_signed(" << rhs << ")));\n";
+      } else {
+        os << indent(level) << name << " = (" << lhs << " " << op << " "
+           << rhs << ");\n";
+      }
       break;
-    case ICmpInst::ICMP_SLE:
-      os << indent(level) << name << " = ((__as_signed(" << lhs << ")) <= (__as_signed(" << rhs << ")));\n";
-      break;
+    }
     default: {
       std::ostringstream ss;
       ss << "ERROR: Unknown ICmp predicate: " << IC->getPredicate() << std::endl;
@@ -1684,6 +1711,24 @@ std::string MetalEmitter::emitExpr(const Value* V) {
     }
     if (V->getType()->isStructTy()) {
       return "/* undef */ {}";
+    }
+    // Change 2: soft-double undef/poison. MSL has no implicit int->acpp_f64
+    // conversion, so `int` literal zero cannot stand in for a double undef
+    // in an fcmp, select, or binary op. Must emit an explicit acpp_f64.
+    if (V->getType()->isDoubleTy()) {
+      return "/* undef */ acpp_f64 { 0u, 0u }";
+    }
+    // <N x double> lowered as array<acpp_f64, N> (see mapType). Fill lanes
+    // with soft-fp64 zero so brace-init matches element type.
+    if (auto *VT = dyn_cast<FixedVectorType>(V->getType())) {
+      if (VT->getElementType()->isDoubleTy()) {
+        std::string lanes;
+        for (unsigned i = 0; i < VT->getNumElements(); ++i) {
+          if (i) lanes += ", ";
+          lanes += "acpp_f64 { 0u, 0u }";
+        }
+        return "/* undef */ { " + lanes + " }";
+      }
     }
     return "/* undef */ 0";
   }
