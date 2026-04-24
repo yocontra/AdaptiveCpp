@@ -78,15 +78,29 @@ std::optional<uint64_t> getConstU64(llvm::Value* V) {
 std::optional<std::string> extractStringConstant(llvm::Value* V, std::string& errorStr) {
   llvm::GlobalVariable* GV = nullptr;
 
-  // Handle either direct GlobalVariable or ConstantExpr that refers to one
-  if (auto* gv = llvm::dyn_cast<llvm::GlobalVariable>(V)) {
-    GV = gv;
-  } else if (auto* CE = llvm::dyn_cast<llvm::ConstantExpr>(V)) {
-    if (CE->getOpcode() == llvm::Instruction::AddrSpaceCast) {
-      return extractStringConstant(CE->getOperand(0), errorStr);
-    } else if (CE->getOpcode() == llvm::Instruction::GetElementPtr) {
-      GV = llvm::dyn_cast<llvm::GlobalVariable>(CE->getOperand(0));
+  // Peel ConstantExpr layers that wrap the underlying GlobalVariable.
+  // After AddressSpaceInferencePass, string constants sit in AS 4
+  // (MetalEmitter's `constant` address space) while metal-symbol helpers
+  // still take `ptr noundef` (generic AS 0); clang emits an
+  // `addrspacecast` ConstantExpr at the call site to bridge. GEP layers
+  // also appear when the frontend indexes into the array to get the first
+  // character. Strip both before dispatching on the base value.
+  llvm::Value* cur = V;
+  while (cur) {
+    if (auto* gv = llvm::dyn_cast<llvm::GlobalVariable>(cur)) {
+      GV = gv;
+      break;
     }
+    if (auto* CE = llvm::dyn_cast<llvm::ConstantExpr>(cur)) {
+      auto op = CE->getOpcode();
+      if (op == llvm::Instruction::GetElementPtr ||
+          op == llvm::Instruction::AddrSpaceCast ||
+          op == llvm::Instruction::BitCast) {
+        cur = CE->getOperand(0);
+        continue;
+      }
+    }
+    break;
   }
 
   if (!GV || !GV->hasInitializer()) {
@@ -360,7 +374,15 @@ std::string MetalEmitter::emitConstantInitializer(const Constant* C) {
 void MetalEmitter::emitGlobalConstants() {
   for (const GlobalVariable& GV : M.globals()) {
     if (!GV.isConstant() || !GV.hasInitializer()) continue;
-    if (GV.getAddressSpace() != 4) continue;
+    // AS 4 is AddressSpace::Constant (the canonical home for readonly
+    // globals after AddressSpaceInferencePass). AS 1 is Global: a readonly
+    // global declared without an explicit address-space attribute (common
+    // for `static const` arrays in the soft-fp64 libkernel, e.g. SLEEF
+    // polynomial-coefficient tables) ends up here because the pass only
+    // rewrites pointer operands of loads/stores, not the GlobalVariable
+    // definition itself. Both represent module-scope readonly data and
+    // lower to MSL's `constant` address space identically.
+    if (GV.getAddressSpace() != 4 && GV.getAddressSpace() != 1) continue;
 
     std::string name = valueName(&GV);
     std::string init = emitConstantInitializer(GV.getInitializer());
@@ -507,6 +529,91 @@ struct i48u {
     return (ulong)w[0] | ((ulong)w[1] << 16) | ((ulong)w[2] << 32);
   }
 };
+
+// i128 dynamic-amount shifts. i128 is lowered to `uint4` (little-endian
+// 32-bit words: x=[0..31], y=[32..63], z=[64..95], w=[96..127]). Constant
+// shift amounts are peeled into per-lane expressions in the Shl/LShr/AShr
+// cases; dynamic amounts (e.g. soft-fp64 mantissa alignment inside div /
+// sqrt) go through these helpers. Shift amount is masked to [0, 128) per
+// LLVM's `shl nuw` / `lshr exact` semantics for well-defined i128 shifts;
+// shifts ≥ 128 yield zero (logical) or -1 (arithmetic with negative x).
+inline uint4 __acpp_i128_shl(uint4 x, uint s) {
+  s &= 127u;
+  uint ws = s >> 5;
+  uint bs = s & 31u;
+  uint4 w = uint4(0u);
+  w.w = (ws == 0u) ? x.w : (ws == 1u) ? x.z : (ws == 2u) ? x.y : x.x;
+  w.z = (ws == 0u) ? x.z : (ws == 1u) ? x.y : (ws == 2u) ? x.x : 0u;
+  w.y = (ws == 0u) ? x.y : (ws == 1u) ? x.x : 0u;
+  w.x = (ws == 0u) ? x.x : 0u;
+  if (bs == 0u) return w;
+  uint4 r;
+  r.w = (w.w << bs) | (w.z >> (32u - bs));
+  r.z = (w.z << bs) | (w.y >> (32u - bs));
+  r.y = (w.y << bs) | (w.x >> (32u - bs));
+  r.x = (w.x << bs);
+  return r;
+}
+
+inline uint4 __acpp_i128_lshr(uint4 x, uint s) {
+  s &= 127u;
+  uint ws = s >> 5;
+  uint bs = s & 31u;
+  uint4 w = uint4(0u);
+  w.x = (ws == 0u) ? x.x : (ws == 1u) ? x.y : (ws == 2u) ? x.z : x.w;
+  w.y = (ws == 0u) ? x.y : (ws == 1u) ? x.z : (ws == 2u) ? x.w : 0u;
+  w.z = (ws == 0u) ? x.z : (ws == 1u) ? x.w : 0u;
+  w.w = (ws == 0u) ? x.w : 0u;
+  if (bs == 0u) return w;
+  uint4 r;
+  r.x = (w.x >> bs) | (w.y << (32u - bs));
+  r.y = (w.y >> bs) | (w.z << (32u - bs));
+  r.z = (w.z >> bs) | (w.w << (32u - bs));
+  r.w = (w.w >> bs);
+  return r;
+}
+
+// i128 big-integer comparisons. MSL's `uint4 < uint4` is component-wise
+// (returns `bool4`), whereas LLVM's `icmp ult i128` mandates a scalar
+// `i1` that treats the four lanes as one unsigned 128-bit integer. Lane
+// weight: x (bits [0..31]) lowest, w (bits [96..127]) highest. Compare
+// from most-significant lane down.
+inline bool __acpp_i128_ult(uint4 a, uint4 b) {
+  if (a.w != b.w) return a.w < b.w;
+  if (a.z != b.z) return a.z < b.z;
+  if (a.y != b.y) return a.y < b.y;
+  return a.x < b.x;
+}
+// Signed variant: top lane compared as int (sign bit lives in a.w bit 31);
+// lower lanes are unsigned because once the sign/magnitude of the top word
+// is resolved, the remaining bits always compare unsigned.
+inline bool __acpp_i128_slt(uint4 a, uint4 b) {
+  int aw = (int)a.w;
+  int bw = (int)b.w;
+  if (aw != bw) return aw < bw;
+  if (a.z != b.z) return a.z < b.z;
+  if (a.y != b.y) return a.y < b.y;
+  return a.x < b.x;
+}
+
+inline uint4 __acpp_i128_ashr(uint4 x, uint s) {
+  s &= 127u;
+  uint sign = (x.w & 0x80000000u) ? 0xffffffffu : 0u;
+  uint ws = s >> 5;
+  uint bs = s & 31u;
+  uint4 w;
+  w.x = (ws == 0u) ? x.x : (ws == 1u) ? x.y : (ws == 2u) ? x.z : x.w;
+  w.y = (ws == 0u) ? x.y : (ws == 1u) ? x.z : (ws == 2u) ? x.w : sign;
+  w.z = (ws == 0u) ? x.z : (ws == 1u) ? x.w : sign;
+  w.w = (ws == 0u) ? x.w : sign;
+  if (bs == 0u) return w;
+  uint4 r;
+  r.x = (w.x >> bs) | (w.y << (32u - bs));
+  r.y = (w.y >> bs) | (w.z << (32u - bs));
+  r.z = (w.z >> bs) | (w.w << (32u - bs));
+  r.w = (w.w >> bs) | (sign << (32u - bs));
+  return r;
+}
 )__";
   os << "\n";
 }
@@ -1115,13 +1222,22 @@ bool MetalEmitter::emitCastInstruction(const CastInst* CI, const std::string& na
       const char* fmt;
     };
     CastEntry table[] = {
-      // trunc i128 -> i32
+      // trunc i128 -> i1
+      {"uint4", "bool",  "(({src}.x & 1u) != 0u)"},
+      // trunc i128 -> i8 / i16 / i32
+      {"uint4", "uchar", "(uchar)({src}.x & 0xffu)"},
+      {"uint4", "ushort","(ushort)({src}.x & 0xffffu)"},
       {"uint4", "uint",  "{src}.x"},
-      // truct i128 -> i48u
+      // trunc i128 -> i48u
       {"uint4", "i48u", "i48u(packed_ushort3({src}.x, {src}.y, {src}.z))"},
       // trunc i128 -> i64
       {"uint4", "ulong", "as_type<ulong>({src}.xy)"},
-      // zext i32 -> i128
+      // zext i1 / i8 / i16 / i32 -> i128. MSL implicitly converts bool to
+      // uint (false→0, true→1), so `(uint){src}` works uniformly across
+      // scalar integer sources that fit in 32 bits.
+      {"bool",  "uint4", "uint4((uint){src}, 0u, 0u, 0u)"},
+      {"uchar", "uint4", "uint4((uint){src}, 0u, 0u, 0u)"},
+      {"ushort","uint4", "uint4((uint){src}, 0u, 0u, 0u)"},
       {"uint",  "uint4", "uint4({src}, 0u, 0u, 0u)"},
       // zext i48u -> i128
       {"i48u",  "uint4", "uint4({src}.w[0], {src}.w[1], {src}.w[2], 0u)"},
@@ -1278,14 +1394,29 @@ void MetalEmitter::emitBinaryOperator(const BinaryOperator* BO, const std::strin
              << lanes[1] << "," << lanes[2] << "," << lanes[3] << "); // "
              << instToString(*BO) << "\n";
         } else {
-          errorMsg = "ERROR: uint4 Shl with non-constant shift amount: " + rhs;
+          // Dynamic shift amount — defer to the i128 shl helper emitted by
+          // emitEarlyFp64Helpers. `rhs` is itself a uint4 (LLVM %amt is
+          // i128); MSL has no uint4→uint coercion, so take the low lane.
+          os << indent(level) << name << " = __acpp_i128_shl(" << lhs
+             << ", (" << rhs << ").x); // " << instToString(*BO) << "\n";
         }
       } else {
         os << indent(level) << name << " = " << lhs << " << " << rhs << ";\n";
       }
       break;
     case Instruction::AShr:
-      os << indent(level) << name << " = as_type<" << resultType << ">((__as_signed(" << lhs << ")) >> (__as_signed(" << rhs << ")));\n";
+      if (resultType == "uint4") {
+        // i128 arithmetic right shift. Same word/bit split as LShr but
+        // fills vacated high bits with the sign of x (bit 127 = x.w bit
+        // 31). Constant and dynamic amounts both route through the helper
+        // for simplicity — the constant path could be peeled similar to
+        // LShr but soft-fp64 rarely exercises AShr on i128, so the single
+        // codepath keeps the emitter surface small.
+        os << indent(level) << name << " = __acpp_i128_ashr(" << lhs
+           << ", (" << rhs << ").x); // " << instToString(*BO) << "\n";
+      } else {
+        os << indent(level) << name << " = as_type<" << resultType << ">((__as_signed(" << lhs << ")) >> (__as_signed(" << rhs << ")));\n";
+      }
       break;
 
     case Instruction::LShr:
@@ -1322,7 +1453,8 @@ void MetalEmitter::emitBinaryOperator(const BinaryOperator* BO, const std::strin
              << lanes[1] << "," << lanes[2] << "," << lanes[3] << "); // "
              << instToString(*BO) << "\n";
         } else {
-          errorMsg = "ERROR: uint4 LShr with non-constant shift amount: " + rhs;
+          os << indent(level) << name << " = __acpp_i128_lshr(" << lhs
+             << ", (" << rhs << ").x); // " << instToString(*BO) << "\n";
         }
       } else {
         os << indent(level) << name << " = " << lhs << " >> " << rhs << ";\n";
@@ -1390,9 +1522,29 @@ void MetalEmitter::emitICmpInstruction(const ICmpInst* IC, const std::string& na
     case ICmpInst::ICMP_SLT:
     case ICmpInst::ICMP_SLE: {
       if (isI128) {
-        errorMsg = "Ordered icmp on i128 is not supported by the Metal "
-                   "emitter (would need a big-integer comparator).";
-        return;
+        // Big-integer compare. `__acpp_i128_ult` / `__acpp_i128_slt` are
+        // the primitives (emitted in emitEarlyFp64Helpers); the other six
+        // predicates derive algebraically:
+        //   UGT(a,b) = ULT(b,a);  ULE(a,b) = !ULT(b,a);  UGE(a,b) = !ULT(a,b).
+        const char *primitive = nullptr;
+        bool swap = false;
+        bool negate = false;
+        switch (IC->getPredicate()) {
+          case ICmpInst::ICMP_ULT: primitive = "__acpp_i128_ult"; break;
+          case ICmpInst::ICMP_UGT: primitive = "__acpp_i128_ult"; swap = true; break;
+          case ICmpInst::ICMP_ULE: primitive = "__acpp_i128_ult"; swap = true; negate = true; break;
+          case ICmpInst::ICMP_UGE: primitive = "__acpp_i128_ult"; negate = true; break;
+          case ICmpInst::ICMP_SLT: primitive = "__acpp_i128_slt"; break;
+          case ICmpInst::ICMP_SGT: primitive = "__acpp_i128_slt"; swap = true; break;
+          case ICmpInst::ICMP_SLE: primitive = "__acpp_i128_slt"; swap = true; negate = true; break;
+          case ICmpInst::ICMP_SGE: primitive = "__acpp_i128_slt"; negate = true; break;
+          default: break;
+        }
+        const std::string &a = swap ? rhs : lhs;
+        const std::string &b = swap ? lhs : rhs;
+        os << indent(level) << name << " = " << (negate ? "!" : "")
+           << primitive << "(" << a << ", " << b << ");\n";
+        break;
       }
       const char *op = nullptr;
       bool isSigned = false;
@@ -1670,16 +1822,41 @@ bool MetalEmitter::emitCallInstruction(const CallInst* CI, const std::string& na
 
 std::string MetalEmitter::emitExpr(const Value* V) {
   if (auto *CI = dyn_cast<ConstantInt>(V)) {
-    if (CI->getBitWidth() == 1) {
+    unsigned bw = CI->getBitWidth();
+    if (bw == 1) {
       return CI->isZero() ? "false" : "true";
     }
-    uint64_t val = CI->getZExtValue();
-    std::ostringstream hex;
-    hex << "0x" << std::hex << val << "u";
-    if (CI->getBitWidth() == 64) {
-      hex << "l";
+    if (bw <= 64) {
+      uint64_t val = CI->getZExtValue();
+      std::ostringstream hex;
+      hex << "0x" << std::hex << val << "u";
+      if (bw == 64) {
+        hex << "l";
+      }
+      return hex.str();
     }
-    return hex.str();
+    // Change 2: i128 lowers to uint4 (four 32-bit lanes) via mapType. A
+    // wide literal emitted as a single `0x...u` (ulong) paired with a uint4
+    // operand causes MSL to implicitly broadcast the scalar to all lanes
+    // *after truncating to 32 bits* — silently corrupting soft-fp64
+    // mantissa masks like `and i128 %x, 0xfffffffffff`. Render i128
+    // literals as an explicit `uint4(lo0, lo1, hi0, hi1)` constructor so
+    // MSL sees four per-lane values.
+    if (bw == 128) {
+      const llvm::APInt &ap = CI->getValue();
+      auto lane = [&](unsigned start) {
+        return static_cast<uint32_t>(
+            ap.extractBits(32, start).getZExtValue());
+      };
+      std::ostringstream hex;
+      hex << "uint4(0x" << std::hex << lane(0) << "u, 0x" << lane(32)
+          << "u, 0x" << lane(64) << "u, 0x" << lane(96) << "u)";
+      return hex.str();
+    }
+    std::ostringstream ss;
+    ss << "Unsupported ConstantInt bitwidth: " << bw;
+    errorMsg = ss.str();
+    return "";
   }
 
   if (auto *CF = dyn_cast<ConstantFP>(V)) {

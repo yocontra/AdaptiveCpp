@@ -562,7 +562,7 @@ bool LLVMToMetalTranslator::toBackendFlavor(llvm::Module &M, PassHandler& PH) {
         default: return nullptr;
       }
     };
-    llvm::SmallVector<llvm::GlobalValue*, 32> PreLinkUsed;
+    llvm::SmallVector<llvm::GlobalValue*, 64> PreLinkUsed;
     for (const auto& prim : kSoftF64Primitives) {
       llvm::Type* retTy = typeFromCode(prim.sig[0]);
       if (!retTy) continue;
@@ -574,6 +574,68 @@ bool LLVMToMetalTranslator::toBackendFlavor(llvm::Module &M, PassHandler& PH) {
       if (auto* F = llvm::dyn_cast<llvm::Function>(Callee.getCallee()))
         PreLinkUsed.push_back(F);
     }
+
+    // Also anchor every `__acpp_sscp_<name>_f64` math forwarder that
+    // `ReplaceIntrinsics` can produce. Without this, an `llvm.fabs.f64`
+    // (or `llvm.sqrt.f64`, `llvm.copysign.f64`, etc.) introduced by
+    // InstCombine pattern-matching AFTER the first link pass gets remapped
+    // to `__acpp_sscp_fabs_f64` — a symbol the linker never imported
+    // because the call site didn't exist at link time. The result is a
+    // use-of-undeclared-identifier MSL compile failure downstream.
+    //
+    // Signatures derive from the `llvm.<name>.f64` intrinsic each forwarder
+    // replaces: all entries in `remapped_llvm_math_builtins` except
+    // `atan2`, `ldexp`, and `copysign` are unary (double → double); those
+    // three plus `remapped_llvm_math_builtins_renamed` (minnum/maxnum/pow
+    // → fmin/fmax/powr) are binary with the noted special cases.
+    static const struct {
+      const char* llvm_name;
+      bool is_binary;
+      bool second_is_int;
+    } kMathForwarders[] = {
+        // unary f64 forwarders (double → double)
+        {"sin",    false, false}, {"cos",    false, false},
+        {"tan",    false, false}, {"sqrt",   false, false},
+        {"asin",   false, false}, {"acos",   false, false},
+        {"atan",   false, false},
+        {"sinh",   false, false}, {"cosh",   false, false},
+        {"tanh",   false, false},
+        {"log",    false, false}, {"log2",   false, false},
+        {"log10",  false, false},
+        {"exp",    false, false}, {"exp2",   false, false},
+        {"exp10",  false, false},
+        {"fabs",   false, false}, {"floor",  false, false},
+        {"ceil",   false, false},
+        // binary f64 forwarders (double, double) → double
+        {"atan2",    true, false},
+        {"copysign", true, false},
+        {"fmax",     true, false}, // from llvm.maxnum.f64
+        {"fmin",     true, false}, // from llvm.minnum.f64
+        {"powr",     true, false}, // from llvm.pow.f64
+        // binary (double, int) → double
+        {"ldexp", true, true},
+    };
+    llvm::Type* dTy = llvm::Type::getDoubleTy(M.getContext());
+    llvm::Type* iTy = llvm::Type::getInt32Ty(M.getContext());
+    for (const auto& fwd : kMathForwarders) {
+      std::string acppName =
+          std::string{"__acpp_sscp_"} + fwd.llvm_name + "_f64";
+      llvm::SmallVector<llvm::Type*, 3> argTys;
+      argTys.push_back(dTy);
+      if (fwd.is_binary) argTys.push_back(fwd.second_is_int ? iTy : dTy);
+      auto* FT = llvm::FunctionType::get(dTy, argTys, false);
+      auto Callee = M.getOrInsertFunction(acppName, FT);
+      if (auto* F = llvm::dyn_cast<llvm::Function>(Callee.getCallee()))
+        PreLinkUsed.push_back(F);
+    }
+    // `llvm.fmuladd.f64` → `__acpp_sscp_fma_f64` (double, double, double).
+    {
+      auto* FT = llvm::FunctionType::get(dTy, {dTy, dTy, dTy}, false);
+      auto Callee = M.getOrInsertFunction("__acpp_sscp_fma_f64", FT);
+      if (auto* F = llvm::dyn_cast<llvm::Function>(Callee.getCallee()))
+        PreLinkUsed.push_back(F);
+    }
+
     if (!PreLinkUsed.empty())
       llvm::appendToCompilerUsed(M, PreLinkUsed);
   }
@@ -683,6 +745,16 @@ bool LLVMToMetalTranslator::translateToBackendFormat(llvm::Module& FlavoredModul
 
     if (!linkBitcodeFile(FlavoredModule, BuiltinBitcodeFile))
       return false;
+
+    // Re-run AS inference so GlobalVariables newly imported by the link
+    // above land in their canonical address spaces. Soft-fp64's SLEEF
+    // polynomial coefficient tables (`@__const.*kLogkCoef`, etc.) are
+    // `private unnamed_addr constant` in the source, which the frontend
+    // emits in AS 0. Without a second inference pass they stay in AS 0
+    // and MetalEmitter's emitGlobalConstants (which emits AS 4 constants
+    // with MSL's `constexpr constant` keyword) skips them, producing
+    // use-of-undeclared-identifier errors downstream.
+    AddressSpaceInferencePass{getAddressSpaceMap()}.run(FlavoredModule, MAM);
 
     llvm::AlwaysInlinerPass{}.run(FlavoredModule, MAM);
 
