@@ -663,18 +663,51 @@ bool LLVMToMetalTranslator::toBackendFlavor(llvm::Module &M, PassHandler& PH) {
     // → `__acpp_sscp_copysign_f64`), creating a self-call loop.
     bool isSoftF64Core = Name.find("sf64_") == 0;
     if (!isSoftF64Primitive && !isF64MathForwarder && !isSoftF64Core) continue;
-    if (!F.hasFnAttribute(llvm::Attribute::NoInline))
-      F.addFnAttr(llvm::Attribute::NoInline);
-    F.removeFnAttr(llvm::Attribute::AlwaysInline);
-    // `optnone` stops the O3 pipeline from pattern-matching bit-twiddle
-    // soft-fp64 bodies back into LLVM intrinsics. Specifically: without
-    // this, InstCombine recognises `sf64_copysign`'s `(x & ~sign) |
-    // (y & sign)` pattern as `llvm.copysign.f64`, ReplaceIntrinsics
-    // then remaps that to `__acpp_sscp_copysign_f64`, and the body ends
-    // up calling its own forwarder. The soft-fp64 bodies are already
-    // hand-optimised for correctness; further optimisation is unwanted.
-    if (!F.hasFnAttribute(llvm::Attribute::OptimizeNone))
-      F.addFnAttr(llvm::Attribute::OptimizeNone);
+
+    // Helpers with a pointer output parameter (frexp, modf, fract,
+    // lgamma_r, sincos, …) take a caller-stack int*/double* that lives
+    // in AS 5 (thread). MSL has no generic pointer, so the Emitter's
+    // emitted signature `sf64_frexp(double, device void*)` can't accept
+    // a thread pointer from the caller. The only way to propagate the
+    // caller's AS through is to inline the helper into the caller — then
+    // LLVM's InferAddressSpacesPass (run after inlining below) can see
+    // the alloca-rooted pointer and specialise the internal stores.
+    //
+    // Side effect: these helpers won't survive as standalone functions
+    // in the emitted MSL, so the Emitter won't emit them. That's fine:
+    // every call site has the body inlined, and the Emitter sees the
+    // concrete thread-AS load/store there.
+    //
+    // This is safe for pointer-param helpers because their bodies are
+    // write-through-output-ptr + ordinary arithmetic — InstCombine has
+    // no intrinsic to pattern-match them into (there is no
+    // `llvm.frexp.f64` that would collapse the body). The copysign /
+    // fma / fmin self-call loop that motivated `noinline` only affects
+    // the bit-twiddle primitives, which stay `noinline` below.
+    bool hasPtrParam = false;
+    for (llvm::Argument& A : F.args()) {
+      if (A.getType()->isPointerTy()) { hasPtrParam = true; break; }
+    }
+
+    if (hasPtrParam) {
+      F.removeFnAttr(llvm::Attribute::NoInline);
+      F.removeFnAttr(llvm::Attribute::OptimizeNone);
+      if (!F.hasFnAttribute(llvm::Attribute::AlwaysInline))
+        F.addFnAttr(llvm::Attribute::AlwaysInline);
+    } else {
+      if (!F.hasFnAttribute(llvm::Attribute::NoInline))
+        F.addFnAttr(llvm::Attribute::NoInline);
+      F.removeFnAttr(llvm::Attribute::AlwaysInline);
+      // `optnone` stops the O3 pipeline from pattern-matching bit-twiddle
+      // soft-fp64 bodies back into LLVM intrinsics. Specifically: without
+      // this, InstCombine recognises `sf64_copysign`'s `(x & ~sign) |
+      // (y & sign)` pattern as `llvm.copysign.f64`, ReplaceIntrinsics
+      // then remaps that to `__acpp_sscp_copysign_f64`, and the body ends
+      // up calling its own forwarder. The soft-fp64 bodies are already
+      // hand-optimised for correctness; further optimisation is unwanted.
+      if (!F.hasFnAttribute(llvm::Attribute::OptimizeNone))
+        F.addFnAttr(llvm::Attribute::OptimizeNone);
+    }
     if (F.getLinkage() == llvm::GlobalValue::InternalLinkage)
       F.setLinkage(llvm::GlobalValue::ExternalLinkage);
     SoftF64Funcs.push_back(&F);
@@ -757,6 +790,20 @@ bool LLVMToMetalTranslator::translateToBackendFormat(llvm::Module& FlavoredModul
     AddressSpaceInferencePass{getAddressSpaceMap()}.run(FlavoredModule, MAM);
 
     llvm::AlwaysInlinerPass{}.run(FlavoredModule, MAM);
+
+    // Third AS inference sweep. Pointer-parameter soft-fp64 helpers
+    // (frexp, modf, fract, lgamma_r, sincos, …) carry `alwaysinline`
+    // per the post-link preservation tweak above, so the AlwaysInliner
+    // just inlined their bodies into the callers. Those inlined bodies
+    // now reach back to the caller's alloca-rooted pointer (AS 5 =
+    // thread) without crossing a function boundary — which is exactly
+    // the shape LLVM's InferAddressSpacesPass can propagate through.
+    // Without this third sweep the inlined load/store instructions
+    // keep their post-inlining AS-0 pointer operand type, and the
+    // MetalEmitter emits `(device T*)` casts on what is actually
+    // thread-rooted storage, producing `cannot pass pointer to default
+    // address space as a pointer to address space 'device'` MSL errors.
+    AddressSpaceInferencePass{getAddressSpaceMap()}.run(FlavoredModule, MAM);
 
     // Third ReplaceIntrinsics pass: the AlwaysInliner above inlines
     // soft-fp64 bodies from the just-linked libkernel. Those bodies use
