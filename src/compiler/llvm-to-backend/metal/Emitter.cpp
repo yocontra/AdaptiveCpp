@@ -464,7 +464,12 @@ void MetalEmitter::emitEarlyFp64Helpers() {
   // fp64, so we lower every LLVM `double` op to a call into the
   // __acpp_sscp_soft_f64_* library. Storage: two uint halves to sidestep
   // MSL alignment quirks on ulong and keep the struct trivially
-  // memcpy-able.
+  // memcpy-able. `alignas(8)` is REQUIRED: every LLVM fp64 load/store is
+  // IR-annotated `align 8`, and without the specifier MSL gives this
+  // struct 4-byte alignment (max of its uint members). An 8-byte store
+  // through a 4-byte-aligned slot is undefined behaviour by the
+  // IR-to-MSL alignment contract — observed as latent corruption risk
+  // during fp64 reduce triage on Apple silicon.
   //
   // Emitted BEFORE emitTypes() so that LLVM struct types containing an
   // fp64 field (emitted with `acpp_f64` field type) can reference this
@@ -472,7 +477,7 @@ void MetalEmitter::emitEarlyFp64Helpers() {
   // library bodies themselves) so it's available before the Emitter's
   // topological-sort loop emits the soft-fp64 function definitions.
   os << R"__(
-struct acpp_f64 {
+struct alignas(8) acpp_f64 {
   uint lo;
   uint hi;
 };
