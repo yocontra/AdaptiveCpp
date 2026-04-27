@@ -1,38 +1,64 @@
-# External soft-fp64 ABI contract (Metal SSCP libkernel)
+# Metal SSCP fp64: AdaptiveCpp <-> soft-fp64 integration
 
-This document is the **integration contract** between the AdaptiveCpp Metal
-libkernel and an external soft-fp64 implementation. The external
-implementation lives in a separate repository and is consumed by AdaptiveCpp
-via the `ACPP_METAL_EXTERNAL_FP64_DIR` CMake cache variable (see
-`../CMakeLists.txt`).
+Apple GPUs do not implement IEEE 754 fp64 in hardware. The Metal SSCP
+emitter rewrites every `llvm.<op>.f64` arithmetic / conversion / comparison
+op to a call to `__acpp_sscp_*_f64` or `__acpp_sscp_soft_f64_*`. Those
+symbols are provided by the two forwarder TUs in this directory, which
+forward to soft-fp64's `sf64_*` ABI.
 
-> Historical context: the vendored skeleton in this directory (Defines.h,
-> Double.h, Vector.h, MetalFloat64.h) was pulled from the abandoned upstream
-> `philipturner/metal-float64` repo and contains no math bodies. The
-> trap-stubs in `../math.cpp` are the current placeholder. See
-> `./MAINTENANCE.md` for background.
+## Layout
 
-## How the integration works
+| File | Role |
+|------|------|
+| `acpp_soft_fp64_primitives.cpp` | Required primitives: arith / conv / cmp / min-max. Direct forwards to `sf64_*`. |
+| `acpp_soft_fp64_math.cpp`       | Math library: trig / exp-log / pow / classify. Direct forwards to `sf64_*`. |
+| `Defines.h`, `Double.h`, `MetalFloat64.h`, `Vector.h` | Historic skeleton from the abandoned `philipturner/metal-float64` repo. Kept for git-blame continuity; not compiled. See `MAINTENANCE.md`. |
+| `MAINTENANCE.md` | Background on why the local skeleton exists and the migration to soft-fp64. |
 
-1. The external repository provides a set of `.cpp` files implementing the
-   symbols listed below, plus any header files they depend on.
-2. The consumer configures AdaptiveCpp with
-   `-DACPP_METAL_EXTERNAL_FP64_DIR=/path/to/external/src`.
-3. The CMake rule in `../CMakeLists.txt` globs `*.cpp` from that directory
-   and appends them to `METAL_LIBKERNEL_BITCODE_SOURCES`, so they are
-   compiled into the Metal libkernel bitcode alongside `math.cpp`.
-4. At bitcode-link time, the external definitions supersede the trap-stubs
-   via linker symbol preemption (or, if both sides provide the same symbol,
-   the fp64 agent rewires `math.cpp` trap bodies to call external
-   primitives — see "Rewiring math.cpp" below).
+## Consumption: ACPP_SOFT_FP64_SRC_DIR
 
-## Required symbols (primitives)
+soft-fp64 is a **mandatory build dependency** of the Metal libkernel. The
+build is wired up via a single CMake cache variable that points at a
+soft-fp64 source checkout:
+
+```
+cmake -S /path/to/AdaptiveCpp -B build \
+      -DWITH_LLVM_TO_METAL=ON \
+      -DACPP_SOFT_FP64_SRC_DIR=/abs/path/to/soft-fp64
+```
+
+Resolution order (in `../CMakeLists.txt`):
+1. `-DACPP_SOFT_FP64_SRC_DIR=<abs path>` (explicit override)
+2. `ENV{ACPP_SOFT_FP64_SRC_DIR}`
+3. `$ENV{HOME}/Projects/soft-fp64` (common local checkout)
+
+Hard-fails the configure if the path is unset, missing, or doesn't look
+like a soft-fp64 checkout (no `include/soft_fp64/soft_f64.h`). Required
+soft-fp64 tag: `>=v1.2.0`.
+
+soft-fp64's `src/*.cpp` and `src/sleef/*.cpp` are compiled in-place from
+the checkout — no copying, no header rewrites. The build adds three
+`-I` paths (`include/`, `src/`, `src/sleef/`) so soft-fp64's relative
+includes (`"internal.h"`, `"soft_fp64/foo.h"`, `"sleef_internal.h"`,
+`"../../include/soft_fp64/foo.h"`) all resolve naturally.
+
+### Compile flags applied to the libkernel TUs
+
+The Metal libkernel target adds the following flags (covers both
+soft-fp64 and AdaptiveCpp's own libkernel TUs):
+
+| Flag | Reason |
+|------|--------|
+| `-DACPP_HAS_EXTERNAL_SOFT_FP64` | Elides the `__builtin_trap()` fp64 stub block in `../math.cpp` so the forwarders are the sole definers of every `__acpp_sscp_*_f64` symbol. |
+| `-fno-vectorize -fno-slp-vectorize -fno-unroll-loops` | The Metal source emitter cannot translate `<N x T>` element access or large element-wise shifts on packed vectors to MSL. Keeping libkernel TUs scalar prevents surprise vectorised bodies leaking into MSL. |
+| `-DSOFT_FP64_FENV_MODE=0` | MSL has no `thread_local` storage class. Mode 0 ("disabled") compiles `SF64_FE_RAISE` to a no-op and removes the TLS variable. Host-side IEEE flag observability is unaffected — flags are surfaced from outside the kernel anyway. |
+
+## Required ABI symbols
 
 These are emitted by the Metal SSCP compiler
-(`src/compiler/llvm-to-backend/metal/Emitter.cpp`) for every LLVM fp64
-arithmetic / conversion / comparison / min-max / unary-negation op. The
-external dep **must** provide all of them or kernel bitcode will fail to
-link.
+(`src/compiler/llvm-to-backend/metal/Emitter.cpp`) for every LLVM fp64 op.
+The forwarder TUs **must** provide all of them or kernel bitcode will fail
+to link.
 
 ### Arithmetic
 
@@ -45,32 +71,24 @@ double __acpp_sscp_soft_f64_rem(double a, double b);   // frem: IEEE remainder
 double __acpp_sscp_soft_f64_neg(double a);             // -a with IEEE sign flip
 ```
 
-### Min / max (IEEE 754-2008 minNum / maxNum semantics — NaN propagate, signed-zero preserved)
+### Min / max (IEEE 754-2008 minNum / maxNum semantics)
 
 ```c
 double __acpp_sscp_soft_f64_fmin_precise(double a, double b);
 double __acpp_sscp_soft_f64_fmax_precise(double a, double b);
 ```
 
-### Conversions — f64 ↔ f32
+### Conversions
 
 ```c
 double __acpp_sscp_soft_f64_from_f32(float a);
 float  __acpp_sscp_soft_f64_to_f32(double a);
-```
 
-### Conversions — f64 ↔ signed integer
-
-```c
 double  __acpp_sscp_soft_f64_from_i32(int    a);
 double  __acpp_sscp_soft_f64_from_i64(long   a);
 int     __acpp_sscp_soft_f64_to_i32(double a);
 long    __acpp_sscp_soft_f64_to_i64(double a);
-```
 
-### Conversions — f64 ↔ unsigned integer
-
-```c
 double   __acpp_sscp_soft_f64_from_u32(unsigned int   a);
 double   __acpp_sscp_soft_f64_from_u64(unsigned long  a);
 unsigned int  __acpp_sscp_soft_f64_to_u32(double a);
@@ -79,9 +97,6 @@ unsigned long __acpp_sscp_soft_f64_to_u64(double a);
 
 Narrower conversions (`_to_i16`, `_to_i8`, `_to_u16`, `_to_u8`) are emitted
 by the SSCP compiler for narrow integer types — see `Emitter.cpp:988-1007`.
-They follow the same naming pattern: `__acpp_sscp_soft_f64_to_i<N>(double)`
-returning a signed `N`-bit int, `__acpp_sscp_soft_f64_to_u<N>(double)`
-returning unsigned.
 
 ### Comparison
 
@@ -91,102 +106,35 @@ returning unsigned.
 int __acpp_sscp_soft_f64_fcmp(double lhs, double rhs, int pred);
 ```
 
-## Optional symbols (math library)
+## Math-library symbols
 
-The external dep **may** also provide the higher-level IEEE 754 math
-functions. When provided, these replace the `__builtin_trap()` bodies in
-`../math.cpp`. The rewiring is not automatic — the fp64 agent owns
-`math.cpp` and will replace each trap body with a real call when the
-external dep is available.
+`acpp_soft_fp64_math.cpp` provides the higher-level IEEE 754 math
+functions (trig, exp/log, hyperbolic, classification, fract/frexp/modf,
+etc.). The complete list lives in that file; it covers every entry the
+Metal SSCP emitter routes for `llvm.<name>.f64` intrinsics and OpenCL
+math-library calls.
 
-Symbol list (see `../math.cpp` lines 368-481 for the canonical set; this
-README reflects that snapshot):
-
-```c
-// Unary double -> double
-double __acpp_sscp_{acos,acosh,acospi,asin,asinh,asinpi,atan,atanh,atanpi,
-                   cbrt,ceil,cos,cosh,cospi,erf,erfc,exp,exp2,exp10,expm1,
-                   fabs,floor,lgamma,log,log2,log10,log1p,logb,rint,round,
-                   rsqrt,sin,sinh,sinpi,sqrt,tan,tanh,tanpi,tgamma,trunc}_f64(double);
-
-// Binary
-double __acpp_sscp_{atan2,atan2pi,copysign,fdim,fmax,fmin,fmod,hypot,maxmag,
-                    minmag,nextafter,pow,powr,remainder}_f64(double, double);
-
-// Ternary
-double __acpp_sscp_{fma,mad}_f64(double, double, double);
-
-// Mixed signatures
-double __acpp_sscp_fract_f64(double, double* iptr);
-double __acpp_sscp_frexp_f64(double, int* exp);
-int    __acpp_sscp_ilogb_f64(double);
-double __acpp_sscp_ldexp_f64(double, int k);
-double __acpp_sscp_lgamma_r_f64(double, int* signp);
-double __acpp_sscp_modf_f64(double, double* iptr);
-double __acpp_sscp_pown_f64(double, int n);
-double __acpp_sscp_rootn_f64(double, int n);
-int    __acpp_sscp_{isnan,isinf,isfinite,isnormal,signbit}_f64(double);
-```
-
-The special-case `fmin`/`fmax` math-library entry points are IEEE-correct;
-the Metal SSCP emitter routes them to `__acpp_sscp_soft_f64_fmin_precise`
-/ `__acpp_sscp_soft_f64_fmax_precise` rather than calling
+The special-case `fmin` / `fmax` math-library entry points are
+IEEE-correct; the Metal SSCP emitter routes them to
+`__acpp_sscp_soft_f64_fmin_precise` /
+`__acpp_sscp_soft_f64_fmax_precise` rather than calling
 `__acpp_sscp_fmin_f64` / `__acpp_sscp_fmax_f64` directly (see
 `Emitter.cpp:1485-1503`).
 
 ## Calling convention
 
-- Standard C linkage. Use `extern "C"` in C++ sources.
+- Standard C linkage. All forwarders use `HIPSYCL_SSCP_BUILTIN` (default
+  visibility, `extern "C"`) — see
+  `include/hipSYCL/sycl/libkernel/sscp/builtins/builtin_config.hpp`.
 - No SYCL-isms. Bodies run in libkernel bitcode, which is pre-SYCL IR
-  (Clang + libkernel headers only).
-- Every symbol must have `HIPSYCL_SSCP_BUILTIN` visibility (see
-  `../math.cpp` for the macro). Practically: declare with
-  `__attribute__((__visibility__("default")))` and do not mark `static`.
+  (Clang + libkernel headers + soft-fp64 headers only).
 - Pointer arguments (e.g. `double* iptr` in `fract_f64`) are SSCP
   generic-AS pointers — no `__device` / `__global` qualifiers.
 
-## Rewiring math.cpp (fp64 agent responsibility)
-
-When the external dep provides math-library implementations, the fp64
-agent owns this step:
-
-1. Replace each `__builtin_trap()` body in `math.cpp` with a call into the
-   external impl (direct call, or composite of primitives).
-2. Keep the trap-stub as the fallback when
-   `ACPP_METAL_EXTERNAL_FP64_DIR` is unset — guard with a preprocessor
-   macro set by the CMake integration (e.g. add
-   `target_compile_definitions(... PRIVATE ACPP_METAL_EXTERNAL_FP64=1)` to
-   the glue, and `#ifdef ACPP_METAL_EXTERNAL_FP64` in math.cpp around each
-   body).
-
-This README documents the contract; it does not edit math.cpp.
-
-## CMake knob
-
-```cmake
-# In AdaptiveCpp build config:
--DACPP_METAL_EXTERNAL_FP64_DIR=/absolute/path/to/fp64-repo/src
-```
-
-When set, the directory must contain at least one `.cpp` file. All `.cpp`
-files in the directory are compiled into the Metal libkernel bitcode.
-`CONFIGURE_DEPENDS` is used so adding / removing `.cpp` files in the
-external dir re-triggers CMake.
-
 ## Verification
 
-After configuring with the external dep:
-
 ```bash
-# Sanity: the external sources show up in the bitcode target's source list.
-cmake --build <build_dir> --target libkernel-metal-bitcode 2>&1 | grep -i fp64
-
-# End-to-end: pg_accel benches exercise fp64 reduce / sort / agg.
-cd /Users/contra/Projects/pg_accel
-just gpu-build && just gpu-test && just test && just bench
+# Sanity: external sources show up in the bitcode target's source list.
+cmake --build <build_dir> --target libkernel-sscp-metal --verbose 2>&1 | \
+  grep -E "soft_fp64|acpp_soft_fp64"
 ```
-
-Absent the external dep (default), the trap stubs remain active and fp64
-kernels silently trap on dispatch — this is the canary mode. pg_accel's
-`device_has_fp64_cached()` gate keeps fp64 dispatch off on Metal in that
-case, so nothing crashes; cast-down-to-fp32 fallbacks execute instead.

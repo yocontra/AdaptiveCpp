@@ -20,6 +20,7 @@
 #include "hipSYCL/glue/llvm-sscp/jit-reflection/queries.hpp"
 #include "hipSYCL/common/filesystem.hpp"
 #include "hipSYCL/common/debug.hpp"
+#include <llvm/ADT/SmallPtrSet.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/GlobalVariable.h>
@@ -126,6 +127,88 @@ struct ReplaceIntrinsics : llvm::PassInfoMixin<ReplaceIntrinsics> {
     }
   }
 
+  // Soft-fp64 cycle guard. Remapping `llvm.fabs.f64` → `__acpp_sscp_fabs_f64`
+  // (and similar for copysign, etc.) becomes an infinite mutual recursion
+  // when the intrinsic appears inside a function that is itself one side of
+  // the remap chain — either the replacement target (`__acpp_sscp_fabs_f64`)
+  // or the soft-fp64 body it forwards to (`sf64_fabs`). Hit path: the
+  // libkernel bitcode is compiled at `-O3`, clang's InstCombine pattern-
+  // matches sf64_fabs's hand-written bit-twiddle `(x & ~sign_bit)` into a
+  // `call @llvm.fabs.f64`; that survives into the linked module, and then
+  // `F->replaceAllUsesWith(Replacement)` rewrites the call so sf64_fabs's
+  // body becomes `return @__acpp_sscp_fabs_f64(x)`. The forwarder's body is
+  // `return @sf64_fabs(x)`. Every call to either symbol from a user kernel
+  // recurses forever, which AGX Metal compute surfaces as a silent GPU
+  // watchdog hang (`kIOGPUCommandBufferCallbackErrorHang`) on Apple Silicon.
+  //
+  // Fix: detect call sites inside the cycle-risk functions and replace the
+  // intrinsic in-place with its bit-twiddle equivalent (IR-level lowering)
+  // rather than renaming the call. This breaks the cycle at its root without
+  // touching the remap for all other (user-kernel) callers.
+  //
+  // Only fabs and copysign participate in this cycle in practice — InstCombine
+  // can't pattern-match scalar bit ops into transcendentals. The helper below
+  // is only invoked for those two.
+  static bool isCycleRiskyCaller(const llvm::Function* Parent,
+                                 const std::string& ReplacementName) {
+    if (!Parent) return false;
+    // Case 1: the call is inside the replacement target itself.
+    if (Parent->getName() == ReplacementName) return true;
+    // Case 2: the call is inside the matching soft-fp64 body that the
+    // replacement forwards to. `__acpp_sscp_<op>_f64` ↔ `sf64_<op>`.
+    const std::string acpp_prefix = "__acpp_sscp_";
+    const std::string f64_suffix = "_f64";
+    if (ReplacementName.compare(0, acpp_prefix.size(), acpp_prefix) == 0 &&
+        ReplacementName.size() > acpp_prefix.size() + f64_suffix.size() &&
+        ReplacementName.compare(ReplacementName.size() - f64_suffix.size(),
+                                f64_suffix.size(), f64_suffix) == 0) {
+      std::string op = ReplacementName.substr(
+          acpp_prefix.size(),
+          ReplacementName.size() - acpp_prefix.size() - f64_suffix.size());
+      std::string sf64_name = "sf64_" + op;
+      if (Parent->getName() == sf64_name) return true;
+    }
+    return false;
+  }
+
+  // Inline IR lowering for fabs/copysign that would otherwise cycle.
+  // Returns true if the call was handled, false if the intrinsic is not
+  // one we can lower inline (caller should then skip the remap + emit a
+  // diagnostic or leave the intrinsic for a later pass).
+  static bool inlineLowerCycleRiskyIntrinsic(llvm::CallInst* CI,
+                                             const std::string& IntrinName) {
+    llvm::IRBuilder<> B(CI);
+    llvm::LLVMContext& Ctx = CI->getContext();
+    llvm::Type* I64 = llvm::Type::getInt64Ty(Ctx);
+    llvm::Type* Dbl = llvm::Type::getDoubleTy(Ctx);
+    if (IntrinName == "llvm.fabs.f64") {
+      // fabs(x) = bitcast((bitcast(x) & 0x7fffffffffffffff), double)
+      llvm::Value* X = CI->getArgOperand(0);
+      llvm::Value* Bits = B.CreateBitCast(X, I64);
+      llvm::Value* Mask = llvm::ConstantInt::get(I64, 0x7fffffffffffffffULL);
+      llvm::Value* Masked = B.CreateAnd(Bits, Mask);
+      llvm::Value* Result = B.CreateBitCast(Masked, Dbl);
+      CI->replaceAllUsesWith(Result);
+      CI->eraseFromParent();
+      return true;
+    }
+    if (IntrinName == "llvm.copysign.f64") {
+      // copysign(x, y) = bitcast((bitcast(x) & 0x7fff..ff) | (bitcast(y) & 0x8000..00), double)
+      llvm::Value* X = CI->getArgOperand(0);
+      llvm::Value* Y = CI->getArgOperand(1);
+      llvm::Value* XB = B.CreateBitCast(X, I64);
+      llvm::Value* YB = B.CreateBitCast(Y, I64);
+      llvm::Value* XMag = B.CreateAnd(XB, llvm::ConstantInt::get(I64, 0x7fffffffffffffffULL));
+      llvm::Value* YSign = B.CreateAnd(YB, llvm::ConstantInt::get(I64, 0x8000000000000000ULL));
+      llvm::Value* Combined = B.CreateOr(XMag, YSign);
+      llvm::Value* Result = B.CreateBitCast(Combined, Dbl);
+      CI->replaceAllUsesWith(Result);
+      CI->eraseFromParent();
+      return true;
+    }
+    return false;
+  }
+
   llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &MAM) {
     for(const auto& [Name, Value] : Replacement) {
       const auto& [ReplacementName, ArgCount] = Value;
@@ -148,22 +231,60 @@ struct ReplaceIntrinsics : llvm::PassInfoMixin<ReplaceIntrinsics> {
 
         HIPSYCL_DEBUG_INFO << "Metal: ReplaceIntrinsics: Remapping calls from " << Name << " to "
                            << ReplacementName << "\n";
+
+        // Collect all call sites of the intrinsic up-front; we'll split them
+        // into (a) cycle-risk sites handled inline and (b) safe sites to
+        // remap to the replacement symbol. Collecting once avoids iterator
+        // invalidation from the in-place lowering below.
+        llvm::SmallVector<llvm::CallInst*, 16> AllCalls;
+        for (auto* U : F->users()) {
+          if (auto* CI = llvm::dyn_cast<llvm::CallInst>(U)) {
+            AllCalls.push_back(CI);
+          }
+        }
+
+        llvm::SmallVector<llvm::CallInst*, 16> SafeCalls;
+        for (auto* CI : AllCalls) {
+          const llvm::Function* Parent = CI->getFunction();
+          if (isCycleRiskyCaller(Parent, ReplacementName)) {
+            if (inlineLowerCycleRiskyIntrinsic(CI, Name)) {
+              HIPSYCL_DEBUG_INFO
+                  << "Metal: ReplaceIntrinsics: cycle guard — inline-lowered "
+                  << Name << " inside " << Parent->getName().str() << "\n";
+            } else {
+              // Can't inline-lower — leave it; a later pass (ExpandIntrinsics
+              // or LLVM's default intrinsic lowering at codegen) must handle
+              // it. Remapping here would create the recursion cycle.
+              HIPSYCL_DEBUG_INFO
+                  << "Metal: ReplaceIntrinsics: cycle guard — SKIPPING "
+                  << Name << " inside " << Parent->getName().str()
+                  << " (no inline lowering available)\n";
+            }
+          } else {
+            SafeCalls.push_back(CI);
+          }
+        }
+
         if (F->getFunctionType() == Replacement->getFunctionType()) {
-          F->replaceAllUsesWith(Replacement);
+          for (auto* CI : SafeCalls) {
+            llvm::SmallVector<llvm::Value*, 4> Args(CI->args());
+            llvm::CallInst* NewCI = llvm::CallInst::Create(
+                Replacement->getFunctionType(), Replacement, Args, "",
+                CI->getIterator());
+            NewCI->takeName(CI);
+            CI->replaceAllUsesWith(NewCI);
+            CI->eraseFromParent();
+          }
         } else {
           // Signatures differ (e.g. llvm.ctlz has an extra i1 is_zero_undef arg)
-          llvm::SmallVector<llvm::CallInst*, 16> Calls;
-          for (auto* U : F->users()) {
-            if (auto* CI = llvm::dyn_cast<llvm::CallInst>(U)) {
-              Calls.push_back(CI);
-            }
-          }
-          for (auto* CI : Calls) {
+          for (auto* CI : SafeCalls) {
             llvm::SmallVector<llvm::Value*, 4> Args;
             for (unsigned i = 0; i < (unsigned)ArgCount; ++i) {
               Args.push_back(CI->getArgOperand(i));
             }
-            llvm::CallInst* NewCI = llvm::CallInst::Create(Replacement->getFunctionType(), Replacement, Args, "", CI->getIterator());
+            llvm::CallInst* NewCI = llvm::CallInst::Create(
+                Replacement->getFunctionType(), Replacement, Args, "",
+                CI->getIterator());
             NewCI->takeName(CI);
             CI->replaceAllUsesWith(NewCI);
             CI->eraseFromParent();
@@ -251,6 +372,10 @@ struct ExpandIntrinsics : llvm::PassInfoMixin<ExpandIntrinsics> {
         expandAbs(II);
         II->eraseFromParent();
         Changed = true;
+      } else if (ID == llvm::Intrinsic::is_fpclass) {
+        expandIsFPClass(II);
+        II->eraseFromParent();
+        Changed = true;
       } else if (ID == llvm::Intrinsic::scmp || ID == llvm::Intrinsic::ucmp) {
         expandCmpIntrinsic(II);
         II->eraseFromParent();
@@ -269,6 +394,96 @@ struct ExpandIntrinsics : llvm::PassInfoMixin<ExpandIntrinsics> {
 
     return Changed ? llvm::PreservedAnalyses::none()
                    : llvm::PreservedAnalyses::all();
+  }
+
+  // Lower `llvm.is.fpclass.fNN(x, mask)` to scalar integer bit-ops on the
+  // IEEE-754 representation of x. The intrinsic returns i1 (or <N x i1>);
+  // its mask is a 10-bit set selecting the fpclass categories under test:
+  //   0x001 sNaN, 0x002 qNaN, 0x004 -inf, 0x008 -normal, 0x010 -subnormal,
+  //   0x020 -zero, 0x040 +zero, 0x080 +subnormal, 0x100 +normal, 0x200 +inf
+  // InstCombine introduces this intrinsic from hand-written NaN-check /
+  // sign-magnitude bit patterns inside soft-fp64 bodies, and the Metal
+  // emitter has no MSL builtin for it, so we expand it to bit ops here
+  // before MetalEmitter sees the IR. The mask is a compile-time constant
+  // in every observed call site (LLVM requires it), so InstCombine after
+  // this expansion folds away the unused class checks.
+  void expandIsFPClass(llvm::IntrinsicInst* II) {
+    llvm::IRBuilder<> B(II);
+    llvm::LLVMContext& Ctx = II->getContext();
+    llvm::Value* X = II->getArgOperand(0);
+    llvm::Value* Mask = II->getArgOperand(1);
+    llvm::Type* FTy = X->getType();
+    if (FTy->isVectorTy()) {
+      // Vector forms not produced from soft-fp64; bail out so callers
+      // see a clean errorMsg path instead of a miscompile.
+      return;
+    }
+    if (!FTy->isDoubleTy() && !FTy->isFloatTy()) {
+      return;
+    }
+    bool isF64 = FTy->isDoubleTy();
+    llvm::Type* IntTy = llvm::Type::getIntNTy(Ctx, isF64 ? 64 : 32);
+    uint64_t SignMask  = isF64 ? 0x8000000000000000ULL : 0x80000000ULL;
+    uint64_t AbsMask   = isF64 ? 0x7fffffffffffffffULL : 0x7fffffffULL;
+    uint64_t InfBits   = isF64 ? 0x7ff0000000000000ULL : 0x7f800000ULL;
+    uint64_t MantHigh  = isF64 ? 0x0008000000000000ULL : 0x00400000ULL;  // qNaN bit
+    uint64_t MinNorm   = isF64 ? 0x0010000000000000ULL : 0x00800000ULL;
+    auto Const = [&](uint64_t v) { return llvm::ConstantInt::get(IntTy, v); };
+    llvm::Value* Bits = B.CreateBitCast(X, IntTy);
+    llvm::Value* Abs  = B.CreateAnd(Bits, Const(AbsMask));
+    llvm::Value* Sign = B.CreateAnd(Bits, Const(SignMask));
+    llvm::Value* IsNeg = B.CreateICmpNE(Sign, Const(0));
+    llvm::Value* IsZero = B.CreateICmpEQ(Abs, Const(0));
+    llvm::Value* IsInf  = B.CreateICmpEQ(Abs, Const(InfBits));
+    llvm::Value* IsNaN  = B.CreateICmpUGT(Abs, Const(InfBits));
+    llvm::Value* IsSubnorm = B.CreateAnd(
+        B.CreateICmpNE(Abs, Const(0)),
+        B.CreateICmpULT(Abs, Const(MinNorm)));
+    llvm::Value* IsNorm = B.CreateAnd(
+        B.CreateICmpUGE(Abs, Const(MinNorm)),
+        B.CreateICmpULT(Abs, Const(InfBits)));
+    // sNaN (bit 0) vs qNaN (bit 1): IEEE 754-2008 standard rule —
+    // qNaN has the most-significant mantissa bit set, sNaN has it clear.
+    llvm::Value* MantHighSet = B.CreateICmpNE(
+        B.CreateAnd(Abs, Const(MantHigh)), Const(0));
+    llvm::Value* IsQNaN = B.CreateAnd(IsNaN, MantHighSet);
+    llvm::Value* IsSNaN = B.CreateAnd(IsNaN, B.CreateNot(MantHighSet));
+
+    // For each of the 10 mask bits, gate the corresponding class check
+    // with `(mask & bit) != 0`. When mask is constant InstCombine folds
+    // the unused arms away.
+    llvm::Type* I32 = llvm::Type::getInt32Ty(Ctx);
+    auto Bit = [&](uint32_t bit) {
+      llvm::Value* m = B.CreateAnd(Mask, llvm::ConstantInt::get(I32, bit));
+      return B.CreateICmpNE(m, llvm::ConstantInt::get(I32, 0));
+    };
+    llvm::Value* NotNeg = B.CreateNot(IsNeg);
+    llvm::Value* Result = llvm::ConstantInt::getFalse(Ctx);
+    auto Or = [&](llvm::Value* prev, llvm::Value* cond, llvm::Value* test) {
+      return B.CreateOr(prev, B.CreateAnd(cond, test));
+    };
+    // bit 0: sNaN
+    Result = Or(Result, Bit(0x001), IsSNaN);
+    // bit 1: qNaN
+    Result = Or(Result, Bit(0x002), IsQNaN);
+    // bit 2: -inf
+    Result = Or(Result, Bit(0x004), B.CreateAnd(IsNeg, IsInf));
+    // bit 3: -normal
+    Result = Or(Result, Bit(0x008), B.CreateAnd(IsNeg, IsNorm));
+    // bit 4: -subnormal
+    Result = Or(Result, Bit(0x010), B.CreateAnd(IsNeg, IsSubnorm));
+    // bit 5: -zero
+    Result = Or(Result, Bit(0x020), B.CreateAnd(IsNeg, IsZero));
+    // bit 6: +zero
+    Result = Or(Result, Bit(0x040), B.CreateAnd(NotNeg, IsZero));
+    // bit 7: +subnormal
+    Result = Or(Result, Bit(0x080), B.CreateAnd(NotNeg, IsSubnorm));
+    // bit 8: +normal
+    Result = Or(Result, Bit(0x100), B.CreateAnd(NotNeg, IsNorm));
+    // bit 9: +inf
+    Result = Or(Result, Bit(0x200), B.CreateAnd(NotNeg, IsInf));
+
+    II->replaceAllUsesWith(Result);
   }
 
   void expandAbs(llvm::IntrinsicInst* II) {
@@ -842,6 +1057,111 @@ bool LLVMToMetalTranslator::translateToBackendFormat(llvm::Module& FlavoredModul
   }
 
   std::unordered_set<std::string> kernelNames(KernelNames.begin(), KernelNames.end());
+
+  // Reachability prune. Pre-link `appendToCompilerUsed` anchors every
+  // `__acpp_sscp_*_f64` math forwarder so the linker (LinkOnlyNeeded=true)
+  // pulls in their bodies in case the kernel needs them. The post-link
+  // preservation block then keeps every soft-fp64 / `sf64_*` body alive
+  // through DCE so MetalEmitter can topologically sort and emit them.
+  // Combined effect: even a one-line `a + b` kernel ends up with the
+  // entire sf64_pow / sf64_sin / sf64_cos / sf64_log family linked in
+  // and emitted to MSL, producing 60+ MB `.metal` outputs that
+  // `xcrun metal` chokes on. Walk the call graph from each kernel,
+  // delete soft-fp64 functions that aren't transitively reached.
+  {
+    llvm::SmallPtrSet<llvm::Function*, 32> reachable;
+    llvm::SmallVector<llvm::Function*, 16> worklist;
+    // Roots:
+    //   1. The kernel functions themselves.
+    //   2. Every `__acpp_sscp_soft_f64_*` primitive (add/sub/mul/div/rem/
+    //      neg/fcmp/fmin_precise/fmax_precise/from_*/to_*). These are
+    //      EMITTER-IMPLICIT — MetalEmitter emits calls to them as TEXT
+    //      directly from `fadd double`, `fcmp double`, fp64 cast/conv IR
+    //      instructions in the kernel body; the IR itself has no `call`
+    //      to them, so a pure CallBase walk wouldn't find them. Seed them
+    //      unconditionally; their bodies (`sf64_add` etc.) come along
+    //      transitively. Math forwarders like `__acpp_sscp_sin_f64` are
+    //      NOT in this set — they're invoked from the IR via direct
+    //      calls (after ReplaceIntrinsics), so the BFS picks them up
+    //      only when the kernel actually uses them.
+    for (llvm::Function& F : FlavoredModule) {
+      if (F.isDeclaration()) continue;
+      llvm::StringRef Name = F.getName();
+      bool isKernel = kernelNames.count(Name.str()) > 0;
+      bool isImplicitPrimitive = Name.starts_with("__acpp_sscp_soft_f64_");
+      if (isKernel || isImplicitPrimitive) {
+        if (reachable.insert(&F).second) worklist.push_back(&F);
+      }
+    }
+    while (!worklist.empty()) {
+      llvm::Function* F = worklist.pop_back_val();
+      for (llvm::BasicBlock& BB : *F) {
+        for (llvm::Instruction& I : BB) {
+          if (auto* CB = llvm::dyn_cast<llvm::CallBase>(&I)) {
+            llvm::Function* Callee = CB->getCalledFunction();
+            if (Callee && !Callee->isDeclaration() &&
+                reachable.insert(Callee).second) {
+              worklist.push_back(Callee);
+            }
+          }
+        }
+      }
+    }
+    // Drop unreachable soft-fp64 surface functions only — leave other
+    // AdaptiveCpp libkernel functions alone.
+    llvm::SmallVector<llvm::Function*, 64> drop;
+    for (llvm::Function& F : FlavoredModule) {
+      if (F.isDeclaration()) continue;
+      llvm::StringRef Name = F.getName();
+      bool isSoftF64Surface =
+          Name.starts_with("sf64_") ||
+          Name.starts_with("__acpp_sscp_soft_f64_") ||
+          (Name.starts_with("__acpp_sscp_") &&
+           (Name.ends_with("_f64") || Name.ends_with("_f64_precise")));
+      if (isSoftF64Surface && !reachable.contains(&F)) {
+        drop.push_back(&F);
+      }
+    }
+    if (!drop.empty()) {
+      llvm::SmallPtrSet<llvm::GlobalValue*, 32> dropSet(drop.begin(), drop.end());
+      // Rebuild @llvm.compiler.used without the dropped entries; eraseFromParent
+      // on a function still listed there triggers an assertion.
+      if (auto* CU = FlavoredModule.getNamedGlobal("llvm.compiler.used")) {
+        if (auto* Init = llvm::dyn_cast_or_null<llvm::ConstantArray>(CU->getInitializer())) {
+          llvm::SmallVector<llvm::Constant*, 64> kept;
+          llvm::Type* ElemTy = Init->getType()->getElementType();
+          for (unsigned i = 0; i < Init->getNumOperands(); ++i) {
+            llvm::Constant* C = Init->getOperand(i);
+            llvm::Value* V = C->stripPointerCasts();
+            if (auto* GV = llvm::dyn_cast<llvm::GlobalValue>(V)) {
+              if (dropSet.count(GV)) continue;
+            }
+            kept.push_back(C);
+          }
+          if (kept.size() != Init->getNumOperands()) {
+            CU->eraseFromParent();
+            if (!kept.empty()) {
+              auto* NewArrTy = llvm::ArrayType::get(ElemTy, kept.size());
+              auto* NewArr = llvm::ConstantArray::get(NewArrTy, kept);
+              auto* NewCU = new llvm::GlobalVariable(
+                  FlavoredModule, NewArrTy, false,
+                  llvm::GlobalValue::AppendingLinkage, NewArr,
+                  "llvm.compiler.used");
+              NewCU->setSection("llvm.metadata");
+            }
+          }
+        }
+      }
+      for (llvm::Function* F : drop) {
+        F->removeDeadConstantUsers();
+        F->replaceAllUsesWith(llvm::UndefValue::get(F->getType()));
+        F->eraseFromParent();
+      }
+      HIPSYCL_DEBUG_INFO
+          << "LLVMToMetal: reachability prune dropped " << drop.size()
+          << " unreachable soft-fp64 surface functions\n";
+    }
+  }
 
   if (getenv("__ACPP_PRINT_IR_BEFORE_EMIT")) {
     FlavoredModule.print(llvm::errs(), nullptr);

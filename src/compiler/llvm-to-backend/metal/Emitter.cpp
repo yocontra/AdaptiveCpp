@@ -9,6 +9,7 @@
  */
 // SPDX-License-Identifier: BSD-2-Clause
 #include <llvm/IR/Dominators.h>
+#include <llvm/IR/ModuleSlotTracker.h>
 #include <llvm/Analysis/LoopInfo.h>
 #include <llvm/Analysis/PostDominators.h>
 
@@ -1088,21 +1089,29 @@ void MetalEmitter::emitUnaryOperator(const UnaryOperator* UO, const std::string&
   switch (UO->getOpcode()) {
     case Instruction::FNeg: {
       std::string operand = emitExpr(UO->getOperand(0));
-      // Change 2: soft-double fneg. Cannot use `-x` on acpp_f64.
+      // Soft-double fneg: toggle the sign bit in the high 32-bit half of
+      // the `acpp_f64` struct. Always emitted inline rather than routing
+      // through `__acpp_sscp_soft_f64_neg`, which would (a) add an
+      // unnecessary MSL function call for a single-XOR operation, and (b)
+      // infinite-recurse when the fneg appears INSIDE the body of
+      // `sf64_neg` itself: the C++ source `return -a` compiles to
+      // `%2 = fneg double %0`, which MetalEmitter would otherwise lower
+      // back to `__acpp_sscp_soft_f64_neg(t0)` → sf64_neg(t0) → fneg → ...
+      // This cycle silently hangs the GPU on AGX.
       if (UO->getType()->isDoubleTy()) {
-        // TODO(acpp-soft-fp64): __acpp_sscp_soft_f64_neg
-        os << indent(level) << name << " = __acpp_sscp_soft_f64_neg("
-           << operand << "); // " << instToString(*UO) << "\n";
+        os << indent(level) << name << " = acpp_f64 { (" << operand
+           << ").lo, (" << operand << ").hi ^ 0x80000000u }; // "
+           << instToString(*UO) << "\n";
         break;
       }
       if (auto* VT = dyn_cast<FixedVectorType>(UO->getType())) {
         if (VT->getElementType()->isDoubleTy()) {
-          // TODO(acpp-soft-fp64): element-wise unroll for <N x double> fneg
           unsigned N = VT->getNumElements();
           for (unsigned i = 0; i < N; ++i) {
             os << indent(level) << name << "[" << i
-               << "] = __acpp_sscp_soft_f64_neg(" << operand << "[" << i
-               << "]); // " << instToString(*UO) << "\n";
+               << "] = acpp_f64 { (" << operand << "[" << i << "]).lo, ("
+               << operand << "[" << i << "]).hi ^ 0x80000000u }; // "
+               << instToString(*UO) << "\n";
           }
           break;
         }
@@ -1586,15 +1595,66 @@ void MetalEmitter::emitFCmpInstruction(const FCmpInst* FC, const std::string& na
   std::string lhs = emitExpr(FC->getOperand(0));
   std::string rhs = emitExpr(FC->getOperand(1));
 
-  // Change 2: soft-double comparison. Route through a single soft-float
-  // fcmp helper keyed by the LLVM FCmpInst::Predicate enum value.
-  // The libkernel agent provides __acpp_sscp_soft_f64_fcmp(lhs, rhs, pred)
-  // returning bool with the same semantics as LLVM's fcmp for predicate
-  // 0..15 (from FCMP_FALSE to FCMP_TRUE).
+  // Soft-double comparison. Normal path: route through the
+  // `__acpp_sscp_soft_f64_fcmp(lhs, rhs, pred)` helper keyed by the LLVM
+  // FCmpInst::Predicate enum value.
+  //
+  // Cycle guard: `sf64_fcmp` (the helper's soft-fp64 body) compiles from
+  // pure-integer source, but clang InstCombine at the libkernel -O3 build
+  // pattern-matches its bit-twiddle NaN-check sequence into raw LLVM
+  // `fcmp ord` / `fcmp oeq` / `fcmp une` instructions. When MetalEmitter
+  // then lowers those back to `__acpp_sscp_soft_f64_fcmp(...)`, the
+  // helper body calls its own forwarder: sf64_fcmp → wrapper → sf64_fcmp →
+  // ... → AGX GPU watchdog hang. The three predicates empirically
+  // observed inside sf64_fcmp are OEQ (1), ORD (7), and UNE (14); inline
+  // each as ulong bit-twiddle when we detect the enclosing function is
+  // sf64_fcmp or its wrapper, breaking the cycle. Other predicates inside
+  // those functions would indicate a new InstCombine pattern and are
+  // routed back through the helper (likely still cycle — error on the
+  // side of visibility rather than silent hang).
   if (FC->getOperand(0)->getType()->isDoubleTy()) {
-    // TODO(acpp-soft-fp64): __acpp_sscp_soft_f64_fcmp(a, b, predicate)
-    //   predicate values follow llvm::FCmpInst::Predicate (uchar 0..15).
     unsigned pred = static_cast<unsigned>(FC->getPredicate());
+    const llvm::Function* Parent = FC->getFunction();
+    bool inFcmpBody =
+        Parent && (Parent->getName() == "sf64_fcmp" ||
+                   Parent->getName() == "__acpp_sscp_soft_f64_fcmp");
+    if (inFcmpBody && (pred == llvm::FCmpInst::FCMP_OEQ ||
+                       pred == llvm::FCmpInst::FCMP_ORD ||
+                       pred == llvm::FCmpInst::FCMP_UNO ||
+                       pred == llvm::FCmpInst::FCMP_UNE)) {
+      // Bit-twiddle representation of `acpp_f64` as `ulong`, then evaluate
+      // the NaN-aware comparison directly on the bits. Scoped `{}` keeps
+      // the temporaries local so sibling calls don't collide.
+      std::string aBits = "((((ulong)(" + lhs + ").hi) << 32) | (ulong)(" + lhs + ").lo)";
+      std::string bBits = "((((ulong)(" + rhs + ").hi) << 32) | (ulong)(" + rhs + ").lo)";
+      os << indent(level) << "{\n"
+         << indent(level + 1) << "ulong __a = " << aBits << ";\n"
+         << indent(level + 1) << "ulong __b = " << bBits << ";\n"
+         << indent(level + 1) << "ulong __a_abs = __a & 0x7fffffffffffffffull;\n"
+         << indent(level + 1) << "ulong __b_abs = __b & 0x7fffffffffffffffull;\n"
+         << indent(level + 1) << "bool __a_nan = __a_abs > 0x7ff0000000000000ull;\n"
+         << indent(level + 1) << "bool __b_nan = __b_abs > 0x7ff0000000000000ull;\n";
+      if (pred == llvm::FCmpInst::FCMP_ORD) {
+        os << indent(level + 1) << name << " = (!__a_nan) && (!__b_nan);\n";
+      } else if (pred == llvm::FCmpInst::FCMP_UNO) {
+        // unordered: at least one operand is NaN
+        os << indent(level + 1) << name << " = __a_nan || __b_nan;\n";
+      } else if (pred == llvm::FCmpInst::FCMP_OEQ) {
+        // ordered ==: neither NaN, and bits equal OR both zero (+0 == -0)
+        os << indent(level + 1)
+           << "bool __eq = (__a == __b) || ((__a_abs == 0ull) && (__b_abs == 0ull));\n"
+           << indent(level + 1) << name
+           << " = (!__a_nan) && (!__b_nan) && __eq;\n";
+      } else { // FCMP_UNE
+        // unordered !=: at least one NaN, OR bits differ (accounting for +-0)
+        os << indent(level + 1)
+           << "bool __eq = (__a == __b) || ((__a_abs == 0ull) && (__b_abs == 0ull));\n"
+           << indent(level + 1) << name
+           << " = __a_nan || __b_nan || (!__eq);\n";
+      }
+      os << indent(level) << "} // " << instToString(*FC) << "\n";
+      return;
+    }
     os << indent(level) << name << " = __acpp_sscp_soft_f64_fcmp(" << lhs
        << ", " << rhs << ", " << pred << "u); // " << instToString(*FC)
        << "\n";
@@ -1932,9 +1992,28 @@ std::string MetalEmitter::emitExpr(const Value* V) {
 }
 
 std::string MetalEmitter::valueName(const Value* V) {
+  // O(N) guard via two complementary caches.
+  //
+  // 1) `valueNameCache` saves the *result* of printAsOperand+sanitization
+  //    for repeated queries of the same Value within a function emit.
+  // 2) `currentSlotTracker` (built once per Function in collectVariablesInfo)
+  //    is passed to printAsOperand so the first-time lookup of any
+  //    unnamed Value is O(1) amortised against the slot map, instead of
+  //    triggering a fresh SlotTracker that walks the entire enclosing
+  //    function on every call. Without (2), large soft-fp64 helper
+  //    bodies (sf64_fcmp ~400 lines, sf64_add ~520) blew O(N²) CPU per
+  //    function emit and stalled JIT compile for minutes per kernel.
+  auto it = valueNameCache.find(V);
+  if (it != valueNameCache.end()) {
+    return it->second;
+  }
   std::string s;
   raw_string_ostream rso(s);
-  V->printAsOperand(rso, false);
+  if (currentSlotTracker) {
+    V->printAsOperand(rso, false, *currentSlotTracker);
+  } else {
+    V->printAsOperand(rso, false);
+  }
   std::string name = rso.str();
   if (name[0] == '%') {
     name = name.substr(1);
@@ -1944,7 +2023,9 @@ std::string MetalEmitter::valueName(const Value* V) {
       c = '_';
     }
   }
-  return "t" + name;
+  std::string result = "t" + name;
+  valueNameCache.emplace(V, result);
+  return result;
 }
 
 std::string MetalEmitter::basicBlockName(const BasicBlock* BB) {
@@ -2348,6 +2429,14 @@ void MetalEmitter::collectVariablesInfo(const Function& F) {
   phiIncomingFromBlock.clear();
   phiNodes.clear();
   valuesToDeclare.clear();
+  valueNameCache.clear();
+  // Build a per-function ModuleSlotTracker once so that every
+  // valueName() call in the upcoming function emit shares one slot map.
+  // Without this, each Value::printAsOperand reconstructs a fresh
+  // SlotTracker that walks the entire enclosing Function (O(N) per
+  // call → O(N²) for the function's emit).
+  currentSlotTracker = std::make_unique<llvm::ModuleSlotTracker>(F.getParent(), false);
+  currentSlotTracker->incorporateFunction(F);
 
   for (const BasicBlock& BB : F) {
     for (const Instruction& I : BB) {
