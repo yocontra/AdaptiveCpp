@@ -741,10 +741,10 @@ bool MetalEmitter::emitDeclarations() {
   for (auto &[AI, idx] : sortedAllocas) {
     Type *allocTy = dyn_cast<AllocaInst>(AI)->getAllocatedType();
     auto typeName = mapType(allocTy);
-    // Change 1: if this alloca backs an atomic i64 (SYCL atomic_ref<uint64_t>
-    // or LLVM atomicrmw on i64), promote storage to `atomic_ulong` so the
-    // libkernel helper's `__atomic_pointer_cast<long>` cast lands on
-    // layout-compatible storage.
+    // If this alloca backs an atomic i64 (SYCL atomic_ref<uint64_t> or LLVM
+    // atomicrmw on i64), promote storage to `atomic_ulong` so the libkernel
+    // helper's `__atomic_pointer_cast<long>` cast lands on layout-compatible
+    // storage.
     if (atomicI64Values.count(AI) && allocTy->isIntegerTy() &&
         allocTy->getIntegerBitWidth() == 64) {
       typeName = "atomic_ulong";
@@ -1131,10 +1131,9 @@ bool MetalEmitter::emitCastInstruction(const CastInst* CI, const std::string& na
   std::string src = emitExpr(CI->getOperand(0));
   auto srcType = mapType(CI->getSrcTy());
 
-  // Change 2: soft-double conversions. Any cast touching fp64 (source or
-  // destination) is lowered to a libkernel helper. Integer widths 32/64 are
-  // first-class; narrower integers round-trip via i32.
-  // TODO(acpp-soft-fp64): symbols referenced below provided by libkernel.
+  // Soft-double conversions. Any cast touching fp64 (source or destination)
+  // is lowered to a libkernel helper. Integer widths 32/64 are first-class;
+  // narrower integers round-trip via i32.
   auto isF64Ty = [](llvm::Type* T) { return T->isDoubleTy(); };
   auto intBits = [](llvm::Type* T) -> unsigned {
     return T->isIntegerTy() ? T->getIntegerBitWidth() : 0u;
@@ -1301,10 +1300,10 @@ void MetalEmitter::emitBinaryOperator(const BinaryOperator* BO, const std::strin
 
   std::string resultType = mapType(BO->getType());
 
-  // Change 2: soft-double lowering. Any BinaryOperator whose result type is
+  // Soft-double lowering. Any BinaryOperator whose result type is
   // double (scalar or <N x double>) is lowered to a call into the
-  // __acpp_sscp_soft_f64_* library. The libkernel agent provides these
-  // symbols in parallel — linker will complain until they land (expected).
+  // soft-fp64 forwarders (`__acpp_sscp_soft_f64_*`); their bodies live
+  // in `src/libkernel/sscp/metal/float64/`.
   auto softF64Sym = [](unsigned Opcode) -> const char* {
     switch (Opcode) {
       case Instruction::FAdd: return "__acpp_sscp_soft_f64_add";
@@ -1318,7 +1317,6 @@ void MetalEmitter::emitBinaryOperator(const BinaryOperator* BO, const std::strin
 
   if (BO->getType()->isDoubleTy()) {
     if (const char* sym = softF64Sym(BO->getOpcode())) {
-      // TODO(acpp-soft-fp64): __acpp_sscp_soft_f64_{add,sub,mul,div,rem}
       os << indent(level) << name << " = " << sym << "(" << lhs << ", "
          << rhs << "); // " << instToString(*BO) << "\n";
       return;
@@ -1327,7 +1325,6 @@ void MetalEmitter::emitBinaryOperator(const BinaryOperator* BO, const std::strin
   if (auto* VT = dyn_cast<FixedVectorType>(BO->getType())) {
     if (VT->getElementType()->isDoubleTy()) {
       if (const char* sym = softF64Sym(BO->getOpcode())) {
-        // TODO(acpp-soft-fp64): element-wise unroll for <N x double>
         unsigned N = VT->getNumElements();
         for (unsigned i = 0; i < N; ++i) {
           os << indent(level) << name << "[" << i << "] = " << sym << "("
@@ -1502,9 +1499,9 @@ void MetalEmitter::emitICmpInstruction(const ICmpInst* IC, const std::string& na
 
   auto resultType = mapType(IC->getType());
 
-  // Change 2: i128 lowers to `uint4` via mapType (4x uint32). MSL vector-
-  // scalar comparison is component-wise and returns `bool4`, but LLVM's
-  // icmp mandates a scalar `i1` result — reduce via all()/any() for eq/ne.
+  // i128 lowers to `uint4` via mapType (4x uint32). MSL vector-scalar
+  // comparison is component-wise and returns `bool4`, but LLVM's icmp
+  // mandates a scalar `i1` result — reduce via all()/any() for eq/ne.
   // Ordered (unsigned/signed lt/gt/le/ge) comparisons on i128 require a
   // proper big-integer comparator and are not emitted by the soft-fp64
   // prelude in practice; report as unsupported rather than silently emit
@@ -1662,7 +1659,6 @@ void MetalEmitter::emitFCmpInstruction(const FCmpInst* FC, const std::string& na
   }
   if (auto* VT = dyn_cast<FixedVectorType>(FC->getOperand(0)->getType())) {
     if (VT->getElementType()->isDoubleTy()) {
-      // TODO(acpp-soft-fp64): element-wise fcmp unroll for <N x double>
       unsigned N = VT->getNumElements();
       unsigned pred = static_cast<unsigned>(FC->getPredicate());
       for (unsigned i = 0; i < N; ++i) {
@@ -1810,16 +1806,16 @@ bool MetalEmitter::emitCallInstruction(const CallInst* CI, const std::string& na
     return emitMetalInlineCall(CI, name, level);
   }
 
-  // Change 3: IEEE-correct NaN-propagating fmin/fmax to kill the pg_accel
-  // `-ffast-math` workaround. LLVM's llvm.minnum.f32 / llvm.maxnum.f32 are
-  // renamed by ReplaceIntrinsics (LLVMToMetal.cpp) to __acpp_sscp_fmin_f32 /
-  // __acpp_sscp_fmax_f32. Under -ffast-math, InstCombine may drop the
-  // `nnan` contract, and Metal's `metal::fmin` is undefined on NaN in
-  // fast-math mode. We emit an explicit NaN-propagating sequence inline:
+  // IEEE-correct NaN-propagating fmin/fmax. LLVM's `llvm.minnum.f32` /
+  // `llvm.maxnum.f32` are renamed by `ReplaceIntrinsics` (LLVMToMetal.cpp)
+  // to `__acpp_sscp_fmin_f32` / `__acpp_sscp_fmax_f32`. Under `-ffast-math`,
+  // InstCombine may drop the `nnan` contract, and Metal's `metal::fmin` is
+  // undefined on NaN in fast-math mode. Emit an explicit NaN-propagating
+  // sequence inline:
   //   (isnan(a) ? b : (isnan(b) ? a : metal::fmin(a, b)))
-  // For f64 we can't use metal::fmin directly (no native f64 on Metal —
-  // see Change 2 for soft-fp64 lowering). Route to a libkernel precise
-  // variant that propagates NaN in soft-float.
+  // For f64 we can't use `metal::fmin` directly (no native fp64 on Metal —
+  // soft-fp64 lowers each fp64 op into a forwarder call). Route to the
+  // soft-fp64 fmin/fmax_precise primitive instead.
   if (CI->arg_size() == 2) {
     const char* msl_op = nullptr;
     bool is_f32 = false;
@@ -1845,10 +1841,10 @@ bool MetalEmitter::emitCallInstruction(const CallInst* CI, const std::string& na
       return true;
     }
     if (is_f64) {
-      // TODO(acpp-soft-fp64): libkernel agent provides
-      //   __acpp_sscp_soft_f64_fmin_precise / __acpp_sscp_soft_f64_fmax_precise
-      // (NaN-propagating soft-float fmin/fmax). Symbol names stable; this
-      // call may show as an unresolved extern until that lands.
+      // Soft-float NaN-propagating fmin/fmax. The symbols
+      // `__acpp_sscp_soft_f64_fmin_precise` / `_fmax_precise` are
+      // provided by `src/libkernel/sscp/metal/float64/` (forwarders to
+      // `sf64_fmin_precise` / `sf64_fmax_precise`).
       const char* soft_sym = (calleeName == "__acpp_sscp_fmin_f64")
                                  ? "__acpp_sscp_soft_f64_fmin_precise"
                                  : "__acpp_sscp_soft_f64_fmax_precise";
@@ -1900,13 +1896,13 @@ std::string MetalEmitter::emitExpr(const Value* V) {
       }
       return hex.str();
     }
-    // Change 2: i128 lowers to uint4 (four 32-bit lanes) via mapType. A
-    // wide literal emitted as a single `0x...u` (ulong) paired with a uint4
-    // operand causes MSL to implicitly broadcast the scalar to all lanes
-    // *after truncating to 32 bits* — silently corrupting soft-fp64
-    // mantissa masks like `and i128 %x, 0xfffffffffff`. Render i128
-    // literals as an explicit `uint4(lo0, lo1, hi0, hi1)` constructor so
-    // MSL sees four per-lane values.
+    // i128 lowers to uint4 (four 32-bit lanes) via mapType. A wide literal
+    // emitted as a single `0x...u` (ulong) paired with a uint4 operand
+    // causes MSL to implicitly broadcast the scalar to all lanes *after
+    // truncating to 32 bits* — silently corrupting soft-fp64 mantissa masks
+    // like `and i128 %x, 0xfffffffffff`. Render i128 literals as an
+    // explicit `uint4(lo0, lo1, hi0, hi1)` constructor so MSL sees four
+    // per-lane values.
     if (bw == 128) {
       const llvm::APInt &ap = CI->getValue();
       auto lane = [&](unsigned start) {
@@ -1925,8 +1921,8 @@ std::string MetalEmitter::emitExpr(const Value* V) {
   }
 
   if (auto *CF = dyn_cast<ConstantFP>(V)) {
-    // Change 2: fp64 literal -> acpp_f64 struct initializer. Bit-pattern
-    // via the APFloat raw bits so denormals/NaN/Inf round-trip exactly.
+    // fp64 literal -> acpp_f64 struct initializer. Bit-pattern via the
+    // APFloat raw bits so denormals/NaN/Inf round-trip exactly.
     if (CF->getType()->isDoubleTy()) {
       double dv = CF->getValue().convertToDouble();
       uint64_t bits; memcpy(&bits, &dv, sizeof(bits));
@@ -1954,7 +1950,7 @@ std::string MetalEmitter::emitExpr(const Value* V) {
     if (V->getType()->isStructTy()) {
       return "/* undef */ {}";
     }
-    // Change 2: soft-double undef/poison. MSL has no implicit int->acpp_f64
+    // Soft-double undef/poison. MSL has no implicit int->acpp_f64
     // conversion, so `int` literal zero cannot stand in for a double undef
     // in an fcmp, select, or binary op. Must emit an explicit acpp_f64.
     if (V->getType()->isDoubleTy()) {
@@ -2084,8 +2080,8 @@ std::string MetalEmitter::mapType(const Type* T) {
     return typeCache[T] = "array<" + elemType + ", " + std::to_string(AT->getNumElements()) + ">";
   }
 
-  // Change 2: auto-vectorized fp64 kernels may produce <N x double>. Lower
-  // as a fixed-length array so that the element-wise op lowering in the
+  // Auto-vectorized fp64 kernels may produce <N x double>. Lower as a
+  // fixed-length array so that the element-wise op lowering in the
   // emit*Operator paths can index it directly. Restricted to fp64 element
   // types only; full generic vector lowering is a separate effort.
   // TODO(acpp-vector-lowering): generalize to non-fp64 vectors.
@@ -2140,7 +2136,8 @@ std::string MetalEmitter::mapType(const Type* T) {
   } else if (T->isFloatTy()) {
     return typeCache[T] = "float";
   } else if (T->isDoubleTy()) {
-    // Change 2: soft-double lowering. See acpp_f64 helper at emitIntrinsicHelpers.
+    // Soft-double lowering. See `acpp_f64` helper emitted in
+    // `emitEarlyFp64Helpers()`.
     return typeCache[T] = "acpp_f64";
   } else if (T->isHalfTy()) {
     return typeCache[T] = "half";
@@ -2317,10 +2314,10 @@ void MetalEmitter::analyzeCallInsts() {
   }
 }
 
-// Change 1: scan the module for i64 storage that backs an atomic op
-// (LLVM atomic instructions OR libkernel `__acpp_sscp_atomic_*_{i64,u64}`
-// helpers — the SYCL atomic_ref<uint64_t> surface lowers to the helper
-// calls, not to atomicrmw). For every such pointer operand, walk back via
+// Scan the module for i64 storage that backs an atomic op (LLVM atomic
+// instructions OR libkernel `__acpp_sscp_atomic_*_{i64,u64}` helpers — the
+// SYCL atomic_ref<uint64_t> surface lowers to the helper calls, not to
+// atomicrmw). For every such pointer operand, walk back via
 // stripToRootObject and mark each SSA value along the way as atomic-i64 so
 // that mapType emits `atomic_ulong` for the storage declaration.
 void MetalEmitter::analyzeAtomicI64Storage() {
