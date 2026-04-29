@@ -620,6 +620,64 @@ inline uint4 __acpp_i128_ashr(uint4 x, uint s) {
   r.w = (w.w >> bs) | (sign << (32u - bs));
   return r;
 }
+
+// i128 add / sub / mul. MSL's `uint4 + uint4` / `*` / `-` are LANE-WISE
+// vector ops; LLVM's `add/sub/mul i128` mandates one 128-bit integer
+// operation with carry / borrow / cross-product propagation across lanes.
+// Emitting `lhs * rhs` for `mul i128` silently corrupts every soft-fp64
+// mantissa multiply (sf64_mul → returns 0 for normal inputs). Same shape
+// applies to add/sub. Wrap/two's-complement semantics (i.e. mod 2^128).
+// Lanes are little-endian 32-bit words: x=[0..31] lo, w=[96..127] hi.
+inline uint4 __acpp_i128_add(uint4 a, uint4 b) {
+  ulong s0 = (ulong)a.x + (ulong)b.x;
+  ulong s1 = (ulong)a.y + (ulong)b.y + (s0 >> 32);
+  ulong s2 = (ulong)a.z + (ulong)b.z + (s1 >> 32);
+  ulong s3 = (ulong)a.w + (ulong)b.w + (s2 >> 32);
+  return uint4((uint)s0, (uint)s1, (uint)s2, (uint)s3);
+}
+inline uint4 __acpp_i128_sub(uint4 a, uint4 b) {
+  // Two's-complement subtract via add of (~b + 1).
+  ulong s0 = (ulong)a.x + (ulong)(uint)~b.x + 1ul;
+  ulong s1 = (ulong)a.y + (ulong)(uint)~b.y + (s0 >> 32);
+  ulong s2 = (ulong)a.z + (ulong)(uint)~b.z + (s1 >> 32);
+  ulong s3 = (ulong)a.w + (ulong)(uint)~b.w + (s2 >> 32);
+  return uint4((uint)s0, (uint)s1, (uint)s2, (uint)s3);
+}
+// Schoolbook 4-limb x 4-limb multiplication, mod 2^128. Each cross-product
+// is uint32 x uint32 -> uint64, accumulated with carry into the 4 result
+// lanes. Cross-products that would land at bit weights >= 128 are
+// discarded (truncation to 128 bits matches `mul i128` semantics).
+inline uint4 __acpp_i128_mul(uint4 a, uint4 b) {
+  ulong p00 = (ulong)a.x * (ulong)b.x;
+  ulong p01 = (ulong)a.x * (ulong)b.y;
+  ulong p02 = (ulong)a.x * (ulong)b.z;
+  ulong p03 = (ulong)a.x * (ulong)b.w;
+  ulong p10 = (ulong)a.y * (ulong)b.x;
+  ulong p11 = (ulong)a.y * (ulong)b.y;
+  ulong p12 = (ulong)a.y * (ulong)b.z;
+  ulong p20 = (ulong)a.z * (ulong)b.x;
+  ulong p21 = (ulong)a.z * (ulong)b.y;
+  ulong p30 = (ulong)a.w * (ulong)b.x;
+
+  // lane 0 = bits [0..32): low 32 of p00.
+  uint r0 = (uint)p00;
+  // lane 1 = bits [32..64): high 32 of p00 + low 32 of (p01 + p10).
+  ulong c1 = (p00 >> 32)
+           + (p01 & 0xFFFFFFFFul) + (p10 & 0xFFFFFFFFul);
+  uint r1 = (uint)c1;
+  // lane 2 = bits [64..96): carry + high 32 of (p01,p10) + low 32 of (p02,p11,p20).
+  ulong c2 = (c1 >> 32)
+           + (p01 >> 32) + (p10 >> 32)
+           + (p02 & 0xFFFFFFFFul) + (p11 & 0xFFFFFFFFul) + (p20 & 0xFFFFFFFFul);
+  uint r2 = (uint)c2;
+  // lane 3 = bits [96..128): carry + high 32 of (p02,p11,p20) + low 32 of (p03,p12,p21,p30).
+  ulong c3 = (c2 >> 32)
+           + (p02 >> 32) + (p11 >> 32) + (p20 >> 32)
+           + (p03 & 0xFFFFFFFFul) + (p12 & 0xFFFFFFFFul)
+           + (p21 & 0xFFFFFFFFul) + (p30 & 0xFFFFFFFFul);
+  uint r3 = (uint)c3;
+  return uint4(r0, r1, r2, r3);
+}
 )__";
   os << "\n";
 }
@@ -1339,17 +1397,41 @@ void MetalEmitter::emitBinaryOperator(const BinaryOperator* BO, const std::strin
   switch (BO->getOpcode()) {
     case Instruction::FAdd:
     case Instruction::Add:
-      os << indent(level) << name << " = " << lhs << " + " << rhs << "; " << "// " << instToString(*BO) << "\n";
+      if (BO->getOpcode() == Instruction::Add && resultType == "uint4") {
+        // i128 add — see emitEarlyFp64Helpers. MSL's `uint4 + uint4` is
+        // lane-wise (no carry between lanes); LLVM `add i128` requires a
+        // single 128-bit integer add mod 2^128.
+        os << indent(level) << name << " = __acpp_i128_add(" << lhs << ", "
+           << rhs << "); // " << instToString(*BO) << "\n";
+      } else {
+        os << indent(level) << name << " = " << lhs << " + " << rhs << "; " << "// " << instToString(*BO) << "\n";
+      }
       break;
 
     case Instruction::FSub:
     case Instruction::Sub:
-      os << indent(level) << name << " = " << lhs << " - " << rhs << "; " << "// " << instToString(*BO) << "\n";
+      if (BO->getOpcode() == Instruction::Sub && resultType == "uint4") {
+        os << indent(level) << name << " = __acpp_i128_sub(" << lhs << ", "
+           << rhs << "); // " << instToString(*BO) << "\n";
+      } else {
+        os << indent(level) << name << " = " << lhs << " - " << rhs << "; " << "// " << instToString(*BO) << "\n";
+      }
       break;
 
     case Instruction::FMul:
     case Instruction::Mul:
-      os << indent(level) << name << " = " << lhs << " * " << rhs << "; " << "// " << instToString(*BO) << "\n";
+      if (BO->getOpcode() == Instruction::Mul && resultType == "uint4") {
+        // i128 mul — see emitEarlyFp64Helpers. MSL's `uint4 * uint4` is
+        // lane-wise (each lane multiplied independently); LLVM `mul i128`
+        // requires the schoolbook 4-limb-by-4-limb multiplication mod
+        // 2^128. Emitting lane-wise `*` here used to silently corrupt
+        // every soft-fp64 mantissa multiply (sf64_mul -> returns 0 for
+        // normal inputs).
+        os << indent(level) << name << " = __acpp_i128_mul(" << lhs << ", "
+           << rhs << "); // " << instToString(*BO) << "\n";
+      } else {
+        os << indent(level) << name << " = " << lhs << " * " << rhs << "; " << "// " << instToString(*BO) << "\n";
+      }
       break;
 
     case Instruction::FDiv:
