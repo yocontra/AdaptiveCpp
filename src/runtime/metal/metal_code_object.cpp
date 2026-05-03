@@ -37,20 +37,33 @@ namespace rt {
 
 namespace {
 
-// Wait for `pid`, retrying on EINTR. Returns true iff the process exited
-// normally with status 0.
-bool wait_for_child(pid_t pid, const char *tag) {
+// Wait for `pid`, retrying on EINTR. Returns the process exit status (0..255)
+// on normal exit, or -1 on abnormal termination / waitpid failure.
+int wait_for_child_status(pid_t pid, const char *tag) {
   int status = 0;
   while (waitpid(pid, &status, 0) < 0) {
     if (errno == EINTR) continue;
     HIPSYCL_DEBUG_WARNING << "metal_code_object: waitpid failed for " << tag
                           << ": " << std::strerror(errno) << std::endl;
-    return false;
+    return -1;
   }
-  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+  if (!WIFEXITED(status)) {
     HIPSYCL_DEBUG_WARNING
-        << "metal_code_object: " << tag << " exited non-zero ("
-        << (WIFEXITED(status) ? WEXITSTATUS(status) : -1) << ")" << std::endl;
+        << "metal_code_object: " << tag << " terminated abnormally"
+        << std::endl;
+    return -1;
+  }
+  return WEXITSTATUS(status);
+}
+
+// Wait for `pid`, retrying on EINTR. Returns true iff the process exited
+// normally with status 0. Logs non-zero exits at WARNING level.
+bool wait_for_child(pid_t pid, const char *tag) {
+  int rc = wait_for_child_status(pid, tag);
+  if (rc != 0) {
+    HIPSYCL_DEBUG_WARNING
+        << "metal_code_object: " << tag << " exited non-zero (" << rc << ")"
+        << std::endl;
     return false;
   }
   return true;
@@ -223,16 +236,41 @@ std::string locate_archive_builder() {
   return {};
 }
 
+// Result of spawning `acpp-metal-archive-build`. The runtime distinguishes
+// "success" (load the archive) from "intentionally skipped" (no archive on
+// disk, but not a failure — kernel will JIT in-process at first dispatch in
+// each backend) from "failure" (something actually went wrong).
+enum class archive_builder_result {
+  // Archive was written to `metalar_path` and should be loaded.
+  built,
+  // Helper deliberately skipped this lib (e.g. metallib too large, exit 9).
+  // No archive on disk; do not treat as an error.
+  skipped,
+  // Real failure: helper crashed, exited with an unexpected non-zero status,
+  // posix_spawn failed, etc.
+  failed,
+};
+
 // Spawn `acpp-metal-archive-build <metallib> <metalar> <kernel>...` and wait.
-// Returns true iff the helper exited with status 0.
-bool spawn_archive_builder(const std::string& metallib_path,
-                           const std::string& metalar_path,
-                           const std::vector<std::string>& kernel_names) {
+// Distinguishes built / skipped / failed via the helper's exit status.
+//
+// Helper exit-code contract (see src/tools/acpp-metal-archive-build/main.cpp):
+//   0 -> archive written
+//   9 -> intentionally skipped (metallib exceeded ACPP_METAL_ARCHIVE_MAX_BYTES);
+//        no archive produced. Kernel is still functional via in-process JIT in
+//        the original (pre-fork) parent backend; forked children that hit the
+//        same kernel cold will still fail at MTLCompilerService — caller is
+//        responsible for documenting that limitation for skipped libs.
+//   anything else -> real failure
+archive_builder_result spawn_archive_builder(
+    const std::string& metallib_path,
+    const std::string& metalar_path,
+    const std::vector<std::string>& kernel_names) {
   if (kernel_names.empty()) {
     HIPSYCL_DEBUG_WARNING
         << "metal_code_object: no kernel names; skipping archive build"
         << std::endl;
-    return false;
+    return archive_builder_result::failed;
   }
 
   std::string helper = locate_archive_builder();
@@ -258,9 +296,34 @@ bool spawn_archive_builder(const std::string& metallib_path,
     HIPSYCL_DEBUG_WARNING
         << "metal_code_object: posix_spawn(" << argv0 << ") failed: "
         << std::strerror(rc) << std::endl;
-    return false;
+    return archive_builder_result::failed;
   }
-  return wait_for_child(pid, "acpp-metal-archive-build");
+
+  int exit_status = wait_for_child_status(pid, "acpp-metal-archive-build");
+  if (exit_status == 0) {
+    return archive_builder_result::built;
+  }
+  if (exit_status == 9) {
+    // Helper deliberately skipped this metallib. Surface a single warning
+    // naming the metallib + the override knob so the user can opt back in if
+    // they have headroom. The kernels will still work in the parent backend
+    // via in-process JIT at first dispatch; forked workers that hit a skipped
+    // kernel cold will still crash at MTLCompilerService — that's a known
+    // tradeoff documented in CLAUDE.md (MTLBinaryArchive cache).
+    std::error_code ec;
+    auto sz = std::filesystem::file_size(metallib_path, ec);
+    HIPSYCL_DEBUG_WARNING
+        << "metal_code_object: archive build skipped for " << metallib_path
+        << " (size=" << (ec ? 0 : sz)
+        << " bytes; raise ACPP_METAL_ARCHIVE_MAX_BYTES to opt in). Kernel will "
+           "JIT at first dispatch."
+        << std::endl;
+    return archive_builder_result::skipped;
+  }
+  HIPSYCL_DEBUG_WARNING
+      << "metal_code_object: acpp-metal-archive-build exited with status "
+      << exit_status << " for " << metallib_path << std::endl;
+  return archive_builder_result::failed;
 }
 
 // Load an already-serialized `.metalar` file into an MTL::BinaryArchive.
@@ -388,8 +451,24 @@ result metal_sscp_executable_object::build(const std::string& source) {
           << " failed to load; rebuilding" << std::endl;
       std::remove(metalar_path.c_str());
     }
-    if (spawn_archive_builder(produced_metallib, metalar_path, _kernel_names)) {
-      _archive = load_binary_archive_from_url(_device, metalar_path);
+    archive_builder_result rc =
+        spawn_archive_builder(produced_metallib, metalar_path, _kernel_names);
+    switch (rc) {
+      case archive_builder_result::built:
+        _archive = load_binary_archive_from_url(_device, metalar_path);
+        break;
+      case archive_builder_result::skipped:
+        // Intentional skip (e.g. metallib too large). _archive stays nullptr;
+        // the kernel-launch path falls back to in-process pipeline-state
+        // creation (works in parent backend, will fail on forked children for
+        // this specific kernel — known tradeoff, logged once above).
+        break;
+      case archive_builder_result::failed:
+        // Real failure. _archive stays nullptr; the warning was already
+        // emitted by spawn_archive_builder. The fast-path metallib load
+        // still succeeded so the parent backend can run; forked children
+        // will hit MTLCompilerService.
+        break;
     }
   };
 
