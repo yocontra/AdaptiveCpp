@@ -28,10 +28,43 @@
 #include <Metal/Metal.hpp>
 
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <string>
+#include <sys/stat.h>
 
 namespace {
+
+// Skip-when-too-large size threshold. Soft-fp64 metallibs (e.g. sphere_distance
+// + st_length under SLEEF lowering) emit 1.1+ MB metallibs whose AGX pipeline
+// states OOM the helper at addComputePipelineFunctions / serializeToURL with
+// SIGKILL exit 137. When that happens the parent runtime sees a generic crash
+// and falls back to the next-startup MTLCompilerService path — which crashes
+// in forked children. This threshold makes the helper exit gracefully (exit 9)
+// before the OOM, signalling to the runtime that pipeline-state archival was
+// skipped on purpose so it can either accept slower in-process JIT or gate the
+// kernel out for the current backend. Override with ACPP_METAL_ARCHIVE_MAX_BYTES.
+constexpr long long DEFAULT_MAX_METALLIB_BYTES = 900 * 1024;  // 900 KiB
+
+long long get_metallib_size_limit() {
+  if (const char* env = std::getenv("ACPP_METAL_ARCHIVE_MAX_BYTES")) {
+    char* end = nullptr;
+    long long parsed = std::strtoll(env, &end, 10);
+    if (end != env && parsed > 0) {
+      return parsed;
+    }
+  }
+  return DEFAULT_MAX_METALLIB_BYTES;
+}
+
+long long file_size_bytes(const char* path) {
+  struct stat st;
+  if (::stat(path, &st) != 0) {
+    return -1;
+  }
+  return static_cast<long long>(st.st_size);
+}
 
 void log_err(const char* msg, NS::Error* error = nullptr) {
   std::fprintf(stderr, "acpp-metal-archive-build: %s", msg);
@@ -61,6 +94,27 @@ int main(int argc, char** argv) {
 
   const char* metallib_path = argv[1];
   const char* metalar_path = argv[2];
+
+  // Skip-when-too-large size threshold (added to address OOM SIGKILL exit 137
+  // on soft-fp64 metallibs such as sphere_distance / st_length). See
+  // namespace-level DEFAULT_MAX_METALLIB_BYTES for full rationale. Exit 9 is
+  // distinct from any of the existing failure exit codes so the runtime can
+  // distinguish "intentionally skipped, archive will not exist for this lib"
+  // from "helper crashed, retry pending".
+  long long metallib_size = file_size_bytes(metallib_path);
+  long long size_limit = get_metallib_size_limit();
+  if (metallib_size < 0) {
+    std::fprintf(stderr,
+        "acpp-metal-archive-build: cannot stat metallib %s\n", metallib_path);
+    return 4;
+  }
+  if (metallib_size > size_limit) {
+    std::fprintf(stderr,
+        "acpp-metal-archive-build: skipping archive build for %s "
+        "(size=%lld bytes exceeds limit=%lld bytes; soft-fp64 OOM guard)\n",
+        metallib_path, metallib_size, size_limit);
+    return 9;
+  }
 
   NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
 
