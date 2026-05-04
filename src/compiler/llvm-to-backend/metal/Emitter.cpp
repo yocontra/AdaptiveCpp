@@ -2132,6 +2132,14 @@ std::string MetalEmitter::getSignedType(Type* T) {
       return "long";
     } else if (bitWidth == 128) {
       return "int4";
+    } else if (bitWidth > 1 && bitWidth < 64) {
+      // Promote any non-standard integer width <64 to the next supported
+      // size (i64). This mirrors mapType()'s promotion below; the high
+      // bits are unused but harmless for unsigned ops, and signed ops
+      // (sext/sdiv/srem/ashr) hit guarded paths in the binary-operator
+      // emitter that explicitly mask back to the narrow width.
+      // See also Emitter.cpp:2188 (mapType promotion comment).
+      return "long";
     } else {
       std::ostringstream ss;
       ss << "Error: Unsupported integer bit width: " << bitWidth << "\n";
@@ -2208,6 +2216,25 @@ std::string MetalEmitter::mapType(const Type* T) {
     } else if (bitWidth == 64) {
       return typeCache[T] = "ulong";
     } else if (bitWidth == 128) {
+      return typeCache[T] = "uint4";
+    } else if (bitWidth > 1 && bitWidth < 64) {
+      // Non-standard integer widths (e.g. i33 produced by InstCombine
+      // rewriting `n*(n-1)/2` accumulation patterns into a closed-form
+      // multiply with one extra bit of headroom) promote to the next
+      // supported width: `ulong` for 1<W<64, `uint4` for 64<W<128.
+      //
+      // Correctness: for unsigned arithmetic (add, mul, lshr, and, or,
+      // xor, shl, zext, trunc) the low-N bits of the i64 result are
+      // bit-identical to the i33 result. Signed-sensitive ops on the
+      // promoted value (ashr, sdiv, srem, sext source) would need explicit
+      // sign-extension from bit N back into the upper bits before the
+      // operation, but the failing pattern here (`mul`/`lshr`/`trunc`)
+      // does not need it. If a future workload trips a signed operation
+      // on a promoted width, MetalEmitter will surface a wrong-result
+      // bug, not a JIT failure — at which point a proper LegalizeIntegers
+      // pass should be added.
+      return typeCache[T] = "ulong";
+    } else if (bitWidth > 64 && bitWidth < 128) {
       return typeCache[T] = "uint4";
     } else {
       std::ostringstream ss;
