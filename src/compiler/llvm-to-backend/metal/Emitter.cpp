@@ -2050,7 +2050,27 @@ std::string MetalEmitter::emitExpr(const Value* V) {
         return "/* undef */ { " + lanes + " }";
       }
     }
+    // [N x T] aggregate undef. mapType lowers ArrayType to MSL `array<T,N>`,
+    // which `0` is not assignable to; fall back to the type's default ctor.
+    if (V->getType()->isArrayTy()) {
+      return "/* undef */ " + mapType(V->getType()) + "{}";
+    }
     return "/* undef */ 0";
+  }
+
+  // Inline aggregate constants. Without this, a literal like
+  // `[2 x double] [double 1.000000e+00, double 0.000000e+00]` flowing
+  // into a PHI / select / store falls through to `valueName(V)` below,
+  // which returns a sanitized name (e.g. `t_double__1_000000e_00__double__0_000000e_00_`)
+  // that is referenced but never declared in the emitted MSL — producing
+  // "use of undeclared identifier" Metal compile errors. Reuse the same
+  // brace-initializer machinery as the global-constant path so the
+  // literal is emitted in-line at every use site.
+  if (isa<ConstantAggregateZero>(V) || isa<ConstantArray>(V) ||
+      isa<ConstantDataArray>(V) || isa<ConstantStruct>(V) ||
+      isa<ConstantDataVector>(V) || isa<ConstantVector>(V)) {
+    auto* C = cast<Constant>(V);
+    return mapType(V->getType()) + emitConstantInitializer(C);
   }
 
   // Strip pointer casts (addrspacecast, bitcast)
