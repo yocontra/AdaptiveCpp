@@ -184,11 +184,14 @@ metal_allocator::metal_allocator(MTL::Device* device, const device_id &id,
   , _device_id{id}
   , _page_size{static_cast<size_t>(getpagesize())}
   , _delta{calibrated_delta}
-  , _mmap_region(std::make_shared<metal_mmap_region>(
-      static_cast<size_t>(get_total_ram() * mmap_region_size_fraction), _page_size))
+  , _mmap_region(post_fork_child
+        ? nullptr
+        : std::make_shared<metal_mmap_region>(
+              static_cast<size_t>(get_total_ram() * mmap_region_size_fraction),
+              _page_size))
   , _post_fork_child{post_fork_child}
 {
-  if (_delta == static_cast<size_t>(-1)) {
+  if (!_post_fork_child && _delta == static_cast<size_t>(-1)) {
     calibrate();
   }
 }
@@ -205,7 +208,10 @@ metal_allocator::~metal_allocator() {
 }
 
 void metal_allocator::abandon_after_fork() {
-  std::lock_guard<std::mutex> lock{_mutex};
+  // Do not lock _mutex in the child: a multi-threaded parent could fork while
+  // another thread holds it, leaving the child with a locked mutex and no
+  // owner thread. reset_after_fork() calls this from the single surviving
+  // child thread.
   _ptr_to_block.clear();
   _device = nullptr;
   _mmap_region.reset();
@@ -365,6 +371,10 @@ device_id metal_allocator::get_device() const {
 }
 
 MTL::Buffer* metal_allocator::alloc_buffer(size_t size_bytes) {
+  if (!_device || !_mmap_region) {
+    return nullptr;
+  }
+
   const size_t aligned = align_up(size_bytes, _page_size);
   const size_t stride  = metal_gpu_stride(aligned, _page_size);
   void* region_ptr = nullptr;
@@ -416,8 +426,18 @@ MTL::Buffer* metal_allocator::alloc_buffer(size_t size_bytes) {
 }
 
 void metal_allocator::calibrate() {
+  if (!_device || !_mmap_region) {
+    return;
+  }
+
   auto* buffer = _device->newBuffer(_mmap_region->midpoint(), _page_size, MTL::ResourceStorageModeShared,
     ^(void*, NS::UInteger) { });
+  if (!buffer) {
+    register_error(__acpp_here(),
+      error_info{"metal_allocator: calibration allocation failed",
+                 error_type::memory_allocation_error});
+    return;
+  }
   _delta = buffer->gpuAddress() - reinterpret_cast<uintptr_t>(buffer->contents());
   buffer->release();
 }

@@ -182,10 +182,11 @@ public:
   // Drop the cached instance without destroying it, so the next get() re-runs
   // the factory. The parent's executor owns backend handles (command queues,
   // shared events, worker threads) that are invalid on the child side of
-  // fork() — leaking is deliberate. Called only from per-backend fork reset
-  // paths; background workers have already died on fork().
+  // fork() - leaking is deliberate. Called only from per-backend fork reset
+  // paths. Do not take _mutex here: a multi-threaded parent could fork while
+  // another thread holds it, and the child would deadlock trying to lock the
+  // inherited mutex.
   void abandon_after_fork() {
-    std::lock_guard<std::mutex> lock{_mutex};
     (void)_ptr.release();
     _is_initialized.store(false, std::memory_order_release);
   }

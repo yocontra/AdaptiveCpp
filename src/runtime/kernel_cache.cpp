@@ -457,17 +457,18 @@ void kernel_cache::unload() {
 }
 
 void kernel_cache::drop_code_objects_for_backend(backend_id b) {
-  std::lock_guard<std::mutex> lock{_mutex};
-
   // Release every matching unique_ptr without running the destructor, then
   // erase the map entry. The inherited code objects reference backend
   // handles owned by the parent process; running their destructors in the
   // child would either crash in the backend's device-memory teardown path
   // or silently release a handle already invalidated by fork. Leak is
-  // intentional — dropping the entry is enough for the JIT path to rebuild
+  // intentional - dropping the entry is enough for the JIT path to rebuild
   // cleanly against post-fork backend handles. The persistent on-disk
   // cache is untouched; only the in-memory objects pointing into parent-
-  // owned driver state are abandoned.
+  // owned driver state are abandoned. Do not lock _mutex here: a
+  // multi-threaded parent may fork while another thread holds it, and the
+  // child would inherit that locked state with no owner thread left to
+  // release it.
   for (auto it = _code_objects.begin(); it != _code_objects.end();) {
     if (it->second && it->second->managing_backend() == b) {
       (void)it->second.release();

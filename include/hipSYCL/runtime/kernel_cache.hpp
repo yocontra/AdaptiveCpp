@@ -334,7 +334,7 @@ public:
       HIPSYCL_DEBUG_WARNING
           << "kernel_cache: Fast-failing poisoned binary id "
           << kernel_configuration::to_string(id_of_binary)
-          << " — prior failure: " << it->second << std::endl;
+          << " - prior failure: " << it->second << std::endl;
       return nullptr;
     }
 
@@ -378,7 +378,9 @@ public:
   // destructor in the child would either crash or silently release a handle
   // already invalidated by fork. Called by the backend under the same
   // dispatch chokepoint that detects the fork, so no other path can observe
-  // the abandoned entries before they are gone from the map.
+  // the abandoned entries before they are gone from the map. This is
+  // intentionally lock-free because the child could inherit _mutex in a
+  // locked state from a vanished parent thread.
   void drop_code_objects_for_backend(backend_id b);
 
   // Stitches together the persisten cache path with the id of the binary to a unique path.
