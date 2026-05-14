@@ -122,6 +122,40 @@ std::optional<std::string> extractStringConstant(llvm::Value* V, std::string& er
   return result;
 }
 
+std::string f32IsNanExpr(const std::string& x) {
+  return "((as_type<uint>(" + x + ") & 0x7fffffffu) > 0x7f800000u)";
+}
+
+std::string f32SignBitBoolExpr(const std::string& x) {
+  return "((as_type<uint>(" + x + ") & 0x80000000u) != 0u)";
+}
+
+std::string f32SignBitUIntExpr(const std::string& x) {
+  return "(" + f32SignBitBoolExpr(x) + " ? 1u : 0u)";
+}
+
+std::string f32OrderedMinExpr(const std::string& a, const std::string& b) {
+  return "((" + a + ") < (" + b + ") ? (" + a + ") : ((" + b + ") < (" +
+         a + ") ? (" + b + ") : (" + f32SignBitBoolExpr(a) + " ? (" + a +
+         ") : (" + b + "))))";
+}
+
+std::string f32OrderedMaxExpr(const std::string& a, const std::string& b) {
+  return "((" + a + ") > (" + b + ") ? (" + a + ") : ((" + b + ") > (" +
+         a + ") ? (" + b + ") : (" + f32SignBitBoolExpr(a) + " ? (" + b +
+         ") : (" + a + "))))";
+}
+
+std::string f32MinNumExpr(const std::string& a, const std::string& b) {
+  return "(" + f32IsNanExpr(a) + " ? (" + b + ") : (" + f32IsNanExpr(b) +
+         " ? (" + a + ") : " + f32OrderedMinExpr(a, b) + "))";
+}
+
+std::string f32MaxNumExpr(const std::string& a, const std::string& b) {
+  return "(" + f32IsNanExpr(a) + " ? (" + b + ") : (" + f32IsNanExpr(b) +
+         " ? (" + a + ") : " + f32OrderedMaxExpr(a, b) + "))";
+}
+
 struct EmitContext {
   const llvm::Function* F;
   std::string name;
@@ -1888,38 +1922,36 @@ bool MetalEmitter::emitCallInstruction(const CallInst* CI, const std::string& na
     return emitMetalInlineCall(CI, name, level);
   }
 
-  // IEEE-correct NaN-propagating fmin/fmax. LLVM's `llvm.minnum.f32` /
+  // IEEE-correct minNum/maxNum fmin/fmax. LLVM's `llvm.minnum.f32` /
   // `llvm.maxnum.f32` are renamed by `ReplaceIntrinsics` (LLVMToMetal.cpp)
   // to `__acpp_sscp_fmin_f32` / `__acpp_sscp_fmax_f32`. Under `-ffast-math`,
   // InstCombine may drop the `nnan` contract, and Metal's `metal::fmin` is
-  // undefined on NaN in fast-math mode. Emit an explicit NaN-propagating
-  // sequence inline:
-  //   (isnan(a) ? b : (isnan(b) ? a : metal::fmin(a, b)))
-  // For f64 we can't use `metal::fmin` directly (no native fp64 on Metal —
+  // undefined on NaN in fast-math mode. Emit explicit bitwise NaN and
+  // signed-zero handling inline.
+  // For f64 we can't use `metal::fmin` directly (no native fp64 on Metal -
   // soft-fp64 lowers each fp64 op into a forwarder call). Route to the
   // soft-fp64 fmin/fmax_precise primitive instead.
   if (CI->arg_size() == 2) {
-    const char* msl_op = nullptr;
     bool is_f32 = false;
     bool is_f64 = false;
-    if (calleeName == "__acpp_sscp_fmin_f32") { msl_op = "metal::fmin"; is_f32 = true; }
-    else if (calleeName == "__acpp_sscp_fmax_f32") { msl_op = "metal::fmax"; is_f32 = true; }
+    if (calleeName == "__acpp_sscp_fmin_f32") { is_f32 = true; }
+    else if (calleeName == "__acpp_sscp_fmax_f32") { is_f32 = true; }
     else if (calleeName == "__acpp_sscp_fmin_f64") { is_f64 = true; }
     else if (calleeName == "__acpp_sscp_fmax_f64") { is_f64 = true; }
 
     if (is_f32) {
-      // Defensive NaN-propagating sequence for any __acpp_sscp_fmin_f32 /
+      // Defensive minNum/maxNum sequence for any __acpp_sscp_fmin_f32 /
       // __acpp_sscp_fmax_f32 call that survives inlining (the libkernel body
       // in math.cpp already supplies IEEE 754-2008 NaN + signed-zero
       // semantics and is always_inline, so in practice this branch is
-      // unreachable — kept as a safety net).
+      // unreachable - kept as a safety net).
       std::string a = emitExpr(CI->getArgOperand(0));
       std::string b = emitExpr(CI->getArgOperand(1));
-      os << indent(level) << name << " = ("
-         << "isnan(" << a << ") ? (" << b << ") : "
-         << "isnan(" << b << ") ? (" << a << ") : " << msl_op << "(" << a
-         << ", " << b << ")"
-         << "); // " << instToString(*CI) << "\n";
+      const std::string minmax =
+          calleeName == "__acpp_sscp_fmin_f32" ? f32MinNumExpr(a, b)
+                                               : f32MaxNumExpr(a, b);
+      os << indent(level) << name << " = " << minmax
+         << "; // " << instToString(*CI) << "\n";
       return true;
     }
     if (is_f64) {
@@ -2706,6 +2738,32 @@ bool MetalEmitter::emitMetalInlineCall(const llvm::CallInst* CI, const std::stri
     } else {
       os << indent(level) << *funcName << ";\n";
     }
+    return true;
+  }
+
+  if (*funcName == "isnan" && CI->arg_size() == 2 &&
+      CI->getArgOperand(1)->getType()->isFloatTy()) {
+    std::string x = emitExpr(CI->getArgOperand(1));
+    os << indent(level) << name << " = (" << f32IsNanExpr(x)
+       << " ? 1u : 0u);\n";
+    return true;
+  }
+
+  if (*funcName == "signbit" && CI->arg_size() == 2 &&
+      CI->getArgOperand(1)->getType()->isFloatTy()) {
+    std::string x = emitExpr(CI->getArgOperand(1));
+    os << indent(level) << name << " = " << f32SignBitUIntExpr(x) << ";\n";
+    return true;
+  }
+
+  if ((*funcName == "fmin" || *funcName == "fmax") && CI->arg_size() == 3 &&
+      CI->getArgOperand(1)->getType()->isFloatTy() &&
+      CI->getArgOperand(2)->getType()->isFloatTy()) {
+    std::string a = emitExpr(CI->getArgOperand(1));
+    std::string b = emitExpr(CI->getArgOperand(2));
+    const std::string value =
+        *funcName == "fmin" ? f32MinNumExpr(a, b) : f32MaxNumExpr(a, b);
+    os << indent(level) << name << " = " << value << ";\n";
     return true;
   }
 
