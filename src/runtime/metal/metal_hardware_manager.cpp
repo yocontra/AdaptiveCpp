@@ -717,7 +717,8 @@ metal_hardware_manager::metal_hardware_manager()
   rebuild_devices();
 }
 
-void metal_hardware_manager::rebuild_devices() {
+void metal_hardware_manager::rebuild_devices(
+    const std::vector<size_t>* inherited_deltas) {
   // Enumerate Metal devices via MTLCopyAllDevices (IOKit-backed) rather than
   // MTLCreateSystemDefaultDevice. The default-device path funnels through
   // SLSMainDisplayID -> WindowServer mach port lookup, which hangs in
@@ -752,7 +753,12 @@ void metal_hardware_manager::rebuild_devices() {
     };
     _devices.emplace_back(device);
     _contexts.emplace_back(metal_hardware_context{device});
-    _allocators.emplace_back(device, id);
+    const size_t inherited_delta =
+        (inherited_deltas && i < inherited_deltas->size())
+            ? (*inherited_deltas)[i]
+            : static_cast<size_t>(-1);
+    _allocators.emplace_back(device, id, inherited_delta,
+                             inherited_deltas != nullptr);
   }
   devices->release();
 }
@@ -761,21 +767,25 @@ void metal_hardware_manager::reset_after_fork() {
   // Abandon inherited MTLDevice pointers without calling release(). The
   // release path triggers IOGPUDevice / AGX heap teardown that walks parent
   // process memory and crashes in the child. The parent's GPU resources are
-  // reclaimed when it exits; what matters here is that the child rebuilds a
-  // fresh MTLDevice with a process-local XPC connection.
+  // reclaimed when it exits; what matters here is that the child can report
+  // a controlled allocation refusal instead of crashing.
   //
   // clear() on std::vector<MTL::Device*> drops pointers only (trivially
-  // destructible). _contexts and _allocators hold no raw Metal handles that
-  // would survive their destructors — metal_allocator stores MTL::Buffer*
-  // entries but its destructor is defaulted, so those pointers are leaked
-  // rather than released; that is deliberate (see raw_free()). This runs
-  // from a pthread_atfork child-side handler in normal user code (not a
-  // signal handler), so heap allocation in rebuild_devices() is fine.
+  // destructible). Allocators can own MTL::Buffer* entries, so abandon those
+  // maps before clearing the deque; their destructors must not release parent
+  // buffers in the child. This runs from a dispatch chokepoint in normal user
+  // code, so heap allocation in rebuild_devices() is fine.
+  std::vector<size_t> inherited_deltas;
+  inherited_deltas.reserve(_allocators.size());
+  for (auto& allocator : _allocators) {
+    inherited_deltas.push_back(allocator.get_delta());
+    allocator.abandon_after_fork();
+  }
   _devices.clear();
   _contexts.clear();
   _allocators.clear();
 
-  rebuild_devices();
+  rebuild_devices(&inherited_deltas);
 }
 
 metal_inorder_queue* metal_hardware_manager::make_queue(size_t index) {

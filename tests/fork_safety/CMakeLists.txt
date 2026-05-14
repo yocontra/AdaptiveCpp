@@ -2,9 +2,9 @@ cmake_minimum_required(VERSION 3.12)
 
 # Fork-safety tests exercise each backend's per-process reset path at its
 # dispatch chokepoint. Each backend has its own expected outcome:
-#   Metal, HIP/ROCm  — transparent recovery
-#   CUDA, Level Zero — loud refusal with clear error
-#   HIP over CUDA    — loud refusal (delegates to CUDA's answer)
+#   HIP/ROCm         - transparent recovery
+#   Metal, CUDA, Level Zero - loud refusal with clear error
+#   HIP over CUDA    - loud refusal (delegates to CUDA's answer)
 # Each test is skipped if its backend wasn't built.
 
 if(WITH_ACCELERATED_CPU OR APPLE)

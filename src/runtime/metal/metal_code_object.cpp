@@ -466,15 +466,13 @@ result metal_sscp_executable_object::build(const std::string& source) {
       case archive_builder_result::failed:
         // Real failure. _archive stays nullptr; the warning was already
         // emitted by spawn_archive_builder. The fast-path metallib load
-        // still succeeded so the parent backend can run; forked children
-        // will hit MTLCompilerService.
+        // still succeeded, so this run can continue without an archive.
         break;
     }
   };
 
-  // Fast path: previously produced .metallib on disk. newLibrary(url) does
-  // not require MTLCompilerService, so this path is safe on the forked child
-  // side where the parent's XPC connection is no longer reachable.
+  // Fast path: previously produced .metallib on disk. newLibrary(url) avoids
+  // in-process source compilation through MTLCompilerService.
   std::error_code ec;
   if (std::filesystem::exists(metallib_path, ec) && !ec) {
     auto r = load_metal_library_from_url(_library, _device, metallib_path);
@@ -491,9 +489,8 @@ result metal_sscp_executable_object::build(const std::string& source) {
   }
 
   // Slow path: no cached metallib. Compile out-of-process via `xcrun metal`
-  // and `xcrun metallib`. The subprocess has its own MTLCompilerService
-  // connection, so this works in both the pre-fork parent and a forked child
-  // that has already lost access to the inherited connection.
+  // and `xcrun metallib`, so AdaptiveCpp does not need to open
+  // MTLCompilerService in-process for source compilation.
   std::string produced = compile_msl_to_metallib(source, id_str);
   if (!produced.empty()) {
     auto r = load_metal_library_from_url(_library, _device, produced);

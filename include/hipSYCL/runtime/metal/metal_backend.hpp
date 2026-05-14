@@ -42,8 +42,9 @@ public:
 
 private:
   // Fork detection. Called from the dispatch chokepoints before any Metal
-  // handle from the parent is touched, so the first post-fork dispatch
-  // transparently recovers instead of crashing in MTLCompilerService.
+  // handle from the parent is touched. The child abandons inherited handles
+  // and then refuses new Metal allocations with an AdaptiveCpp error instead
+  // of crashing in the Metal driver.
   void maybe_reset_after_fork() const;
   void reset_after_fork_internal() const;
 

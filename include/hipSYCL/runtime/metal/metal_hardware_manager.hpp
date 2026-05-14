@@ -61,8 +61,8 @@ private:
   int _gpu_family;
   // Cached aspect probes. Populated once in the constructor so has() is a
   // pure member read and never re-enters the Metal runtime. Stored per
-  // context (not a function-local static) so forked children rebuilt via
-  // reset_after_fork() observe the current-process Metal device and env.
+  // context (not a function-local static) so post-fork refusal paths observe
+  // the current process environment.
   bool _supports_atomic64 = false;
   bool _soft_fp64_enabled = false;
 };
@@ -76,11 +76,10 @@ public:
   virtual device_id get_device_id(std::size_t index) const override;
   virtual std::size_t get_num_platforms() const override;
 
-  // Abandon (do NOT release) the inherited MTLDevice and everything built on
-  // top of it, then re-enumerate. Used by metal_backend::reset_after_fork()
-  // so the child side of fork() gets a fresh MTLDevice with its own
-  // process-local XPC link. Calling release() on the parent's handles would
-  // walk dead XPC / IOGPUDevice state and crash the child.
+  // Abandon, without releasing, inherited MTLDevice and allocator state, then
+  // re-enumerate enough device information for a controlled post-fork refusal.
+  // Calling release() on the parent's handles would walk dead XPC /
+  // IOGPUDevice state and crash the child.
   void reset_after_fork();
 
   virtual ~metal_hardware_manager();
@@ -89,7 +88,7 @@ private:
   metal_allocator* get_allocator(size_t index);
   metal_inorder_queue* make_queue(size_t index);
 
-  void rebuild_devices();
+  void rebuild_devices(const std::vector<size_t>* inherited_deltas = nullptr);
 
   std::vector<MTL::Device*> _devices;
   std::vector<metal_hardware_context> _contexts;

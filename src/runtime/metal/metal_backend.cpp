@@ -86,6 +86,7 @@ std::string metal_backend::get_name() const {
 
 std::unique_ptr<backend_executor>
 metal_backend::create_inorder_executor(device_id dev, int priority) {
+  maybe_reset_after_fork();
   std::unique_ptr<inorder_queue> q(_hw.make_queue(dev.get_id()));
   return std::make_unique<inorder_executor>(std::move(q));
 }
@@ -107,12 +108,12 @@ void metal_backend::reset_after_fork_internal() const {
   //  2. Abandon the multi_queue_executor: it holds metal_inorder_queue
   //     objects with MTLCommandQueue / MTLSharedEvent / SharedEventListener
   //     — release() into those walks parent-process IOGPUDevice memory.
-  //  3. Reset the hardware manager: abandon the inherited MTLDevice
-  //     vectors, re-enumerate against a process-local XPC link.
+  //  3. Reset the hardware manager: abandon the inherited MTLDevice and
+  //     allocator state, then re-enumerate enough device information for the
+  //     child to produce a controlled allocation refusal.
   //
-  // The next dispatch rebuilds everything against fresh handles; compiled
-  // .metallib / .metalar files on disk are still reusable and reload
-  // without touching MTLCompilerService in the child.
+  // macOS Metal still cannot allocate driver resources safely in this child;
+  // metal_allocator reports that limitation before calling into the driver.
   if (auto cache = kernel_cache::get())
     cache->drop_code_objects_for_backend(backend_id::metal);
   _executor.abandon_after_fork();

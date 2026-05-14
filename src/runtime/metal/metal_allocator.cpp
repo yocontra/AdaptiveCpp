@@ -10,6 +10,7 @@
 // SPDX-License-Identifier: BSD-2-Clause
 
 #include "hipSYCL/runtime/metal/metal_allocator.hpp"
+#include "hipSYCL/runtime/error.hpp"
 
 #include <Metal/Metal.hpp>
 #include <sys/mman.h>
@@ -177,18 +178,25 @@ struct metal_mmap_region {
   std::map<void*, size_t> _free_blocks;
 };
 
-metal_allocator::metal_allocator(MTL::Device* device, const device_id &id)
+metal_allocator::metal_allocator(MTL::Device* device, const device_id &id,
+                                 size_t calibrated_delta, bool post_fork_child)
   : _device{device}
   , _device_id{id}
   , _page_size{static_cast<size_t>(getpagesize())}
-  , _delta{(size_t)-1}
+  , _delta{calibrated_delta}
   , _mmap_region(std::make_shared<metal_mmap_region>(
       static_cast<size_t>(get_total_ram() * mmap_region_size_fraction), _page_size))
+  , _post_fork_child{post_fork_child}
 {
-  calibrate();
+  if (_delta == static_cast<size_t>(-1)) {
+    calibrate();
+  }
 }
 
 metal_allocator::~metal_allocator() {
+  if (_post_fork_child) {
+    return;
+  }
   for (auto& [ptr, block] : _ptr_to_block) {
     if (block.buffer) {
       block.buffer->release();
@@ -196,10 +204,30 @@ metal_allocator::~metal_allocator() {
   }
 }
 
+void metal_allocator::abandon_after_fork() {
+  std::lock_guard<std::mutex> lock{_mutex};
+  _ptr_to_block.clear();
+  _device = nullptr;
+  _mmap_region.reset();
+}
+
+size_t metal_allocator::get_delta() const {
+  return _delta;
+}
+
 void* metal_allocator::raw_allocate(
   size_t min_alignment, size_t size_bytes,
   const allocation_hints &hints)
 {
+  if (_post_fork_child) {
+    register_error(__acpp_here(),
+      error_info{"metal_allocator: Metal allocations after fork() without "
+                 "exec are not supported on macOS. Create Metal resources "
+                 "only in the child process, or use fork+exec/spawn.",
+                 error_type::runtime_error});
+    return nullptr;
+  }
+
   auto buffer = alloc_buffer(size_bytes);
   if (!buffer) {
     return nullptr;
@@ -221,6 +249,15 @@ void *metal_allocator::raw_allocate_usm(
   size_t size_bytes,
   const allocation_hints &hints)
 {
+  if (_post_fork_child) {
+    register_error(__acpp_here(),
+      error_info{"metal_allocator: Metal USM allocations after fork() without "
+                 "exec are not supported on macOS. Create Metal resources "
+                 "only in the child process, or use fork+exec/spawn.",
+                 error_type::runtime_error});
+    return nullptr;
+  }
+
   auto buffer = alloc_buffer(size_bytes);
   if (!buffer) {
     return nullptr;
@@ -240,6 +277,15 @@ metal_allocator::raw_allocate_optimized_host(
   size_t min_alignment, size_t size_bytes,
   const allocation_hints &hints)
 {
+  if (_post_fork_child) {
+    register_error(__acpp_here(),
+      error_info{"metal_allocator: Metal host allocations after fork() without "
+                 "exec are not supported on macOS. Create Metal resources "
+                 "only in the child process, or use fork+exec/spawn.",
+                 error_type::runtime_error});
+    return nullptr;
+  }
+
   auto buffer = alloc_buffer(size_bytes);
   if (!buffer) {
     return nullptr;
@@ -258,15 +304,16 @@ void metal_allocator::raw_free(void *mem)
 {
   if (!mem) return;
 
-  // Note: this is only ever called for allocations owned by *this* allocator
-  // instance. Post-fork, metal_hardware_manager::reset_after_fork() destroys
-  // and rebuilds the allocator, so any buffers inherited from the parent are
-  // abandoned (not released) before raw_free() can see them.
+  // Note: this is only ever called for allocations owned by this allocator
+  // instance. Post-fork child allocators refuse new allocations, and inherited
+  // parent buffers are abandoned before raw_free() can see them.
   std::lock_guard<std::mutex> lock{_mutex};
   auto it = _ptr_to_block.find(mem);
   if (it != _ptr_to_block.end()) {
     if(it->second.buffer) {
-      it->second.buffer->release();
+      if (!_post_fork_child) {
+        it->second.buffer->release();
+      }
     } else {
       std::free(mem);
     }

@@ -43,7 +43,9 @@ public:
     undefined = 3
   };
 
-  metal_allocator(MTL::Device* device, const device_id &id);
+  metal_allocator(MTL::Device* device, const device_id &id,
+                  size_t calibrated_delta = static_cast<size_t>(-1),
+                  bool post_fork_child = false);
   ~metal_allocator();
 
   virtual void* raw_allocate(size_t min_alignment, size_t size_bytes,
@@ -66,6 +68,9 @@ public:
                             int advise) const override;
 
   virtual device_id get_device() const override;
+
+  void abandon_after_fork();
+  size_t get_delta() const;
 
   // Returns the Metal buffer and offset for a given USM pointer
   std::tuple<MTL::Buffer*, size_t, usm_alloc_type> get_usm_block(const void* ptr) const;
@@ -98,6 +103,7 @@ private:
   std::map<void*, usm_block> _ptr_to_block;
   mutable std::mutex _mutex;
   std::shared_ptr<metal_mmap_region> _mmap_region;
+  bool _post_fork_child;
 };
 
 

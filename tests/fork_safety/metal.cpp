@@ -1,12 +1,11 @@
-// Metal fork-safety: transparent recovery. The parent submits a trivial
-// kernel, forks, and the child must succeed on a fresh submission. The
-// backend's internal pid_guard detects the fork at get_executor() entry,
-// drops inherited MTL::* handles via kernel_cache / hw_manager reset, and
-// the post-fork submission reloads the .metallib + .metalar from disk
-// without touching MTLCompilerService.
+// Metal fork-safety: loud refusal. macOS Metal cannot safely allocate driver
+// resources in a child forked from a process that has already used Metal. The
+// child must see a controlled AdaptiveCpp error instead of crashing in the
+// Metal driver.
 
 #include <sys/wait.h>
 #include <unistd.h>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <sycl/sycl.hpp>
@@ -33,13 +32,40 @@ int run_kernel(sycl::queue &q) {
   return 0;
 }
 
+int submit_expecting_error() {
+  std::atomic<bool> saw_error{false};
+  sycl::queue q{sycl::async_handler{[&](sycl::exception_list list) {
+    for (auto &e : list) {
+      (void)e;
+      saw_error.store(true);
+    }
+  }}};
+
+  int rc = 1;
+  try {
+    rc = run_kernel(q);
+  } catch (const sycl::exception &) {
+    saw_error.store(true);
+  } catch (...) {
+    saw_error.store(true);
+  }
+  try {
+    q.wait_and_throw();
+  } catch (const sycl::exception &) {
+    saw_error.store(true);
+  } catch (...) {
+    saw_error.store(true);
+  }
+  return saw_error.load() || rc != 0 ? 0 : 1;
+}
+
 } // namespace
 
 int main() {
   sycl::queue q;
   const auto plat = q.get_device().get_platform().get_info<sycl::info::platform::name>();
   if (plat.find("Metal") == std::string::npos && plat.find("metal") == std::string::npos) {
-    std::printf("metal fork-safety: no Metal device — skipping\n");
+    std::printf("metal fork-safety: no Metal device - skipping\n");
     return 0;
   }
 
@@ -51,9 +77,8 @@ int main() {
     return 1;
   }
   if (pid == 0) {
-    // Child — first dispatch must trigger the reset path and succeed.
-    sycl::queue child_q;
-    _exit(run_kernel(child_q));
+    // Child: first dispatch must surface a refusal, not crash in Metal.
+    _exit(submit_expecting_error());
   }
 
   int status = 0;
@@ -61,10 +86,13 @@ int main() {
     std::perror("waitpid");
     return 1;
   }
-  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-    std::fprintf(stderr, "metal fork-safety: child failed (status=%d)\n", status);
+  const int child_exit = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+  if (child_exit != 0) {
+    std::fprintf(stderr,
+                 "metal fork-safety: child did not see refusal (status=%d)\n",
+                 status);
     return 1;
   }
-  std::printf("metal fork-safety: OK\n");
+  std::printf("metal fork-safety: correctly refused\n");
   return 0;
 }
