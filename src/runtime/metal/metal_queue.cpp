@@ -139,9 +139,7 @@ result launch_kernel_from_library(
   // MTLBinaryArchive (produced out-of-process by acpp-metal-archive-build)
   // together with MTL::PipelineOptionFailOnBinaryArchiveMiss. When the
   // archive is present, pipeline creation is a pure deserialization and
-  // never round-trips to MTLCompilerService — which is critical in a
-  // PostgreSQL backend forked without exec, where the parent's XPC
-  // connection is no longer reachable.
+  // never round-trips to MTLCompilerService.
   NS::SharedPtr<MTL::ComputePipelineDescriptor> pipe_desc =
       NS::TransferPtr(MTL::ComputePipelineDescriptor::alloc()->init());
   pipe_desc->setComputeFunction(function.get());
@@ -414,13 +412,10 @@ result metal_inorder_queue::submit_memcpy(memcpy_operation& op, const dag_node_p
                  error_type::invalid_parameter_error});
   }
 
-  // Fork-safe fast path for Apple Silicon: resolve any "device" USM
-  // pointers to their shared-storage contents() pointers. If both
-  // endpoints are CPU-addressable, do pure CPU memcpy and skip
-  // MTLBlitCommandEncoder entirely — the blit encoder on AGX drivers
-  // JIT-compiles blit compute programs via MTLCompilerService (XPC),
-  // which is not fork-safe: forked PG-style backends crash in
-  // findOrCreateBlitProgramVariant on first memcpy.
+  // Resolve any "device" USM pointers to their shared-storage contents()
+  // pointers. If both endpoints are CPU-addressable, do pure CPU memcpy and
+  // skip MTLBlitCommandEncoder entirely. The blit encoder on AGX drivers can
+  // JIT-compile internal blit compute programs via MTLCompilerService (XPC).
   //
   // On Apple Silicon, unified memory makes shared-storage CPU access
   // as fast as blit-encoded GPU copy, so we lose nothing.
@@ -700,12 +695,9 @@ result metal_inorder_queue::submit_memset(memset_operation& op, const dag_node_p
   unsigned char pattern = op.get_pattern();
   std::size_t num_bytes = op.get_num_bytes();
 
-  // Fork-safe fast path for Apple Silicon: if the USM buffer is
-  // shared-storage, memset its contents() on CPU and skip
-  // MTLBlitCommandEncoder::fillBuffer entirely. The blit fill path causes
-  // AGX drivers to JIT-compile an internal blit compute program via
-  // MTLCompilerService (XPC), which is not fork-safe: forked PG-style
-  // backends abort in findOrCreateBlitProgramVariant on first memset.
+  // If the USM buffer is shared-storage, memset its contents() on CPU and
+  // skip MTLBlitCommandEncoder::fillBuffer entirely. The blit fill path can
+  // JIT-compile an internal blit compute program via MTLCompilerService (XPC).
   // UMA makes shared-storage CPU access as fast as a GPU blit.
   auto [buffer, usm_offset, _alloc_type] = _allocator->get_usm_block(ptr);
   if (buffer && buffer->storageMode() == MTL::StorageModeShared) {
@@ -756,8 +748,11 @@ result metal_inorder_queue::submit_queue_wait_for(const dag_node_ptr& node) {
   auto handle = metal_evt->request_backend_event();
   NS::SharedPtr<NS::AutoreleasePool> pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
   auto* cmd_buf = new_command_buffer();
+  auto val = ++_event_counter;
   cmd_buf->encodeWait(handle.event, handle.value);
+  cmd_buf->encodeSignalEvent(_shared_event, val);
   cmd_buf->commit();
+  _pending_gpu_event = val;
 
   return make_success();
 }

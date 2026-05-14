@@ -9,18 +9,11 @@
  */
 // SPDX-License-Identifier: BSD-2-Clause
 
-// Metal out-of-order queue correctness. A SYCL queue that is NOT constructed
-// with `sycl::property::queue::in_order{}` must still respect explicit event
-// dependencies passed via `cgh.depends_on(events)` / `q.submit(..., evs)`.
-//
-// Today on Metal this hangs (the event wiring on the out-of-order path is
-// the open item the queue-agent is addressing). The test asserts that it
-// completes within 10 seconds — a timeout is treated as a hard failure so
-// a regression here is visible to CI rather than silently hanging indefinitely.
-//
-// If the Metal backend has decided to downgrade all queues to in-order mode
-// (queue-agent's Option B), this test skips itself — probed by checking the
-// queue's `is_in_order()` property after construction without the flag.
+// Metal out-of-order queue correctness. A SYCL queue that is not constructed
+// with sycl::property::queue::in_order{} must still respect explicit event
+// dependencies passed via cgh.depends_on(events) / q.submit(..., evs).
+// A timeout is treated as a hard failure so dependency-wiring regressions are
+// visible to CI instead of hanging indefinitely.
 
 #include <sycl/sycl.hpp>
 
@@ -40,14 +33,14 @@ bool is_metal(const sycl::device &dev) {
 }
 
 constexpr std::size_t N = 4096;
-constexpr auto kTimeout = std::chrono::seconds(10);
+constexpr auto kTimeout = std::chrono::seconds(30);
 
 } // namespace
 
 int main() {
   sycl::queue probe;
   if (!is_metal(probe.get_device())) {
-    std::printf("metal_ooq: not a Metal device — skipping\n");
+    std::printf("metal_ooq: not a Metal device - skipping\n");
     return 0;
   }
 
@@ -55,7 +48,7 @@ int main() {
   sycl::queue q{probe.get_context(), probe.get_device()};
   if (q.is_in_order()) {
     std::printf(
-        "metal_ooq: backend downgraded all queues to in-order — skipping\n");
+        "metal_ooq: backend downgraded all queues to in-order - skipping\n");
     return 0;
   }
 
@@ -72,28 +65,46 @@ int main() {
     c[i] = 0;
   }
 
+  const auto write_a = [=](sycl::id<1> i) {
+    a[i] = static_cast<int>(i[0]) + 1;
+  };
+  const auto write_b = [=](sycl::id<1> i) {
+    b[i] = static_cast<int>(i[0]) * 2;
+  };
+  const auto combine = [=](sycl::id<1> i) {
+    c[i] = a[i] + b[i];
+  };
+
+  // Compile the exact kernel functors before the watchdog starts. Cold Metal
+  // archive generation can take longer than the dependency watchdog, and this
+  // test is meant to measure queue event wiring rather than first-use JIT cost.
+  q.parallel_for(sycl::range<1>{N}, write_a).wait();
+  q.parallel_for(sycl::range<1>{N}, write_b).wait();
+  q.parallel_for(sycl::range<1>{N}, combine).wait();
+  for (std::size_t i = 0; i < N; ++i) {
+    a[i] = 0;
+    b[i] = 0;
+    c[i] = 0;
+  }
+
   // Run the work + wait on a worker thread so the main thread can enforce
-  // the 10-second deadline. If the wait() hangs (the bug this test is the
+  // the dependency deadline. If the wait() hangs (the bug this test is the
   // gate on), we exit non-zero instead of letting CTest's own timeout fire.
   std::atomic<bool> done{false};
   std::atomic<int> worker_rc{0};
   std::thread worker([&] {
     try {
       sycl::event e1 = q.submit([&](sycl::handler &cgh) {
-        cgh.parallel_for(sycl::range<1>{N},
-                         [=](sycl::id<1> i) { a[i] = static_cast<int>(i[0]) + 1; });
+        cgh.parallel_for(sycl::range<1>{N}, write_a);
       });
       sycl::event e2 = q.submit([&](sycl::handler &cgh) {
-        cgh.parallel_for(sycl::range<1>{N}, [=](sycl::id<1> i) {
-          b[i] = static_cast<int>(i[0]) * 2;
-        });
+        cgh.parallel_for(sycl::range<1>{N}, write_b);
       });
       // Third kernel depends on both. If event wiring is broken, this never
       // enqueues or never signals completion.
       q.submit([&](sycl::handler &cgh) {
          cgh.depends_on({e1, e2});
-         cgh.parallel_for(sycl::range<1>{N},
-                          [=](sycl::id<1> i) { c[i] = a[i] + b[i]; });
+         cgh.parallel_for(sycl::range<1>{N}, combine);
        }).wait();
       q.wait();
       done.store(true, std::memory_order_release);
@@ -108,7 +119,7 @@ int main() {
   while (!done.load(std::memory_order_acquire)) {
     if (std::chrono::steady_clock::now() > deadline) {
       std::fprintf(stderr,
-                   "metal_ooq: q.wait() hung past 10s — out-of-order event "
+                   "metal_ooq: q.wait() hung past 30s - out-of-order event "
                    "dependency wiring is broken\n");
       // Detach: we cannot safely join a hung worker, but the process is
       // going to exit non-zero immediately so the OS will clean it up.
