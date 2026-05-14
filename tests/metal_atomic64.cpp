@@ -9,17 +9,16 @@
  */
 // SPDX-License-Identifier: BSD-2-Clause
 
-// Metal atomic64 correctness. Verifies that Metal's emulated 64-bit atomics
-// (built on top of the Metal native 32-bit atomic primitives) preserve the
-// semantics required by atomic_ref<uint64_t>:
+// Metal atomic64 correctness. Verifies that any Metal device advertising
+// aspect::atomic64 preserves the semantics required by atomic_ref<uint64_t>:
 //   1. fetch_add counts exactly across millions of concurrent workitems.
 //   2. fetch_max converges on the true maximum across all workitems.
-//   3. 64-bit arithmetic does not silently wrap at 2^32 — the value must
+//   3. 64-bit arithmetic does not silently wrap at 2^32 - the value must
 //      be representable above UINT32_MAX.
 //
 // Skipped on devices without aspect::atomic64 so this test can live in the
 // common test binary without becoming noise on backends that don't expose
-// emulated/native 64-bit atomics.
+// 64-bit atomics.
 
 #include <sycl/sycl.hpp>
 
@@ -143,11 +142,11 @@ int main() {
   const sycl::device dev = q.get_device();
 
   if (!is_metal(dev)) {
-    std::printf("metal_atomic64: not a Metal device — skipping\n");
+    std::printf("metal_atomic64: not a Metal device - skipping\n");
     return 0;
   }
   if (!dev.has(sycl::aspect::atomic64)) {
-    std::printf("metal_atomic64: device has no atomic64 aspect — skipping\n");
+    std::printf("metal_atomic64: device has no atomic64 aspect - skipping\n");
     return 0;
   }
 

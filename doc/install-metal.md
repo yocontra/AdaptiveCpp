@@ -53,9 +53,9 @@ The Metal backend is experimental and has the following important limitations:
 
 * **Only SYCL is supported.** The Metal backend supports SYCL kernels only. The portable CUDA dialect (PCUDA) is not supported on Metal.
 
-* **`double` is not supported.** Apple Silicon GPUs do not have hardware support for double-precision floating point. Support for `double` is planned for a future release as a software emulation (soft-double) for compatibility, but it will not deliver hardware-native performance.
+* **`double` is experimental and opt-in.** Apple Silicon GPUs do not have hardware support for double-precision floating point. AdaptiveCpp can expose `aspect::fp64` through a software emulation path when `ACPP_METAL_ENABLE_SOFT_FP64=1` is set in the environment before the Metal device is created. This path is intended for compatibility testing and is much slower than native fp32.
 
-* **64-bit atomics (`atomic64`) are not supported.** Metal does not provide 64-bit atomic operations on Apple Silicon GPUs.
+* **64-bit atomics (`atomic64`) are not currently exposed.** Some Apple GPUs provide a subset of device-memory 64-bit atomic operations, but the current generated MSL is not accepted by Apple's compiler in the required dialect. The backend therefore reports no `aspect::atomic64` so programs can fall back to 32-bit counters or host-side accumulation.
 
 * **SYCL event performance.** The current implementation of SYCL events is not optimal from a performance standpoint. This is a known issue that will be addressed in a future release.
 

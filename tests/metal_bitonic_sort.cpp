@@ -16,10 +16,10 @@
 //
 // Tests:
 //   1. Random arrays of {int32, uint32, int64, uint64, float} at 1024,
-//      65536, 1048576 (1M) elements — assert monotonic non-decreasing output.
-//   2. Key/value sort — payload indices track their keys correctly after
+//      65536, 1048576 (1M) elements - assert monotonic non-decreasing output.
+//   2. Key/value sort - payload indices track their keys correctly after
 //      the permutation.
-//   3. All-equal-keys input — must complete without crashing / hanging and
+//   3. All-equal-keys input - must complete without crashing / hanging and
 //      leave input unchanged.
 //
 // The sort is implemented inline (host-driven bitonic with a parallel_for
@@ -157,7 +157,7 @@ int test_key_value(sycl::queue &q, std::size_t n) {
       break;
     }
     // The GPU payload must still point at an original index whose stored key
-    // matches — we cannot compare against stable_sort's payload because the
+    // matches; we cannot compare against stable_sort's payload because the
     // GPU sort is not stable.
     if (vals[i] >= n) {
       std::fprintf(stderr, "bitonic[kv]: payload out of range @%zu: %u\n", i,
@@ -196,7 +196,7 @@ int main() {
   const sycl::device dev = q.get_device();
 
   if (!is_metal(dev)) {
-    std::printf("metal_bitonic_sort: not a Metal device — skipping\n");
+    std::printf("metal_bitonic_sort: not a Metal device - skipping\n");
     return 0;
   }
 

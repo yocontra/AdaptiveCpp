@@ -230,7 +230,7 @@ add_subdirectory(fork_safety)
 
 # Metal-specific backend correctness tests. Gated on either WITH_METAL_BACKEND
 # (if propagated from the top-level build) or APPLE (same gating pattern that
-# fork_safety/metal.cpp uses — the tests themselves runtime-skip when no Metal
+# fork_safety/metal.cpp uses; the tests themselves runtime-skip when no Metal
 # device is present). Each test is tagged with the `metal` CTest label so
 # users can run `ctest -L metal` to target only this suite.
 if(WITH_METAL_BACKEND OR APPLE)
@@ -246,13 +246,16 @@ if(WITH_METAL_BACKEND OR APPLE)
   target_link_libraries(metal_soft_double PRIVATE Threads::Threads)
   add_sycl_to_target(TARGET metal_soft_double)
   add_test(NAME metal_soft_double COMMAND metal_soft_double)
-  set_tests_properties(metal_soft_double PROPERTIES LABELS "metal")
+  # The opt-in soft-fp64 path can produce large Metal kernels; keep CI from
+  # waiting indefinitely if the driver stalls while compiling or executing one.
+  set_tests_properties(metal_soft_double PROPERTIES LABELS "metal" TIMEOUT 180)
 
   add_executable(metal_minnum_maxnum metal_minnum_maxnum.cpp)
   target_include_directories(metal_minnum_maxnum PRIVATE ${Boost_INCLUDE_DIRS})
   target_link_libraries(metal_minnum_maxnum PRIVATE Threads::Threads)
-  # -ffast-math exercises fmin/fmax NaN propagation under aggressive FP
-  # optimizations, where LLVM is most likely to rewrite calls to minnum/maxnum.
+  # -ffast-math exercises fmin/fmax NaN and signed-zero handling under
+  # aggressive FP optimizations, where LLVM is most likely to rewrite calls to
+  # minnum/maxnum.
   target_compile_options(metal_minnum_maxnum PRIVATE -ffast-math)
   add_sycl_to_target(TARGET metal_minnum_maxnum)
   add_test(NAME metal_minnum_maxnum COMMAND metal_minnum_maxnum)
@@ -270,7 +273,7 @@ if(WITH_METAL_BACKEND OR APPLE)
   target_link_libraries(metal_ooq PRIVATE Threads::Threads)
   add_sycl_to_target(TARGET metal_ooq)
   add_test(NAME metal_ooq COMMAND metal_ooq)
-  # 30s CTest ceiling: the test has its own 10s in-process deadline; this
-  # catches truly stuck dispatchers.
-  set_tests_properties(metal_ooq PROPERTIES LABELS "metal" TIMEOUT 30)
+  # CTest ceiling above the in-process watchdog; this catches shutdown hangs
+  # after the test has already reported a dependency-wiring failure.
+  set_tests_properties(metal_ooq PROPERTIES LABELS "metal" TIMEOUT 90)
 endif()

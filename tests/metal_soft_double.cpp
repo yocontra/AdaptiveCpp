@@ -303,7 +303,7 @@ int test_vector_paths(sycl::queue &q) {
 
 int main() {
   if (!soft_fp64_enabled()) {
-    std::printf("metal_soft_double: ACPP_METAL_ENABLE_SOFT_FP64 not set — skipping\n");
+    std::printf("metal_soft_double: ACPP_METAL_ENABLE_SOFT_FP64 not set - skipping\n");
     return 0;
   }
 
@@ -311,13 +311,13 @@ int main() {
   const sycl::device dev = q.get_device();
 
   if (!is_metal(dev)) {
-    std::printf("metal_soft_double: not a Metal device — skipping\n");
+    std::printf("metal_soft_double: not a Metal device - skipping\n");
     return 0;
   }
 
   if (!dev.has(sycl::aspect::fp64)) {
     std::printf(
-        "metal_soft_double: device lacks fp64 aspect (soft-fp64 JIT path not active) — skipping\n");
+        "metal_soft_double: device lacks fp64 aspect (soft-fp64 JIT path not active) - skipping\n");
     return 0;
   }
 
