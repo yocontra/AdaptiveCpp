@@ -44,7 +44,7 @@ if(WITH_LLVM_TO_METAL)
   # (the dir containing `include/`, `src/`, `src/sleef/`). soft-fp64's
   # `.cpp` files are compiled in-place from that tree - no copying, no
   # rewriting of `#include "../../include/..."` lines, no flattening. The
-  # required tag is `v1.2.0`; soft-fp64 maintains semver, so newer
+  # required tag is `v1.3.0`; soft-fp64 maintains semver, so newer
   # `v1.x` tags are also accepted.
   # ============================================================================
   set(_ACPP_SOFT_FP64_DEFAULT "")
@@ -60,7 +60,7 @@ if(WITH_LLVM_TO_METAL)
   if(NOT ACPP_SOFT_FP64_SRC_DIR)
     message(FATAL_ERROR
       "WITH_LLVM_TO_METAL requires ACPP_SOFT_FP64_SRC_DIR to point at a "
-      "soft-fp64 checkout (tag >=v1.2.0). Set "
+      "soft-fp64 checkout (tag >=v1.3.0). Set "
       "-DACPP_SOFT_FP64_SRC_DIR=<abs path> or env ACPP_SOFT_FP64_SRC_DIR. "
       "AdaptiveCpp's Metal libkernel cannot link without an fp64 "
       "implementation - Apple GPUs lack hardware fp64.")
@@ -76,16 +76,17 @@ if(WITH_LLVM_TO_METAL)
   endif()
 
   # soft-fp64 source files compiled into the Metal libkernel bitcode.
-  # The list is fixed (matches soft-fp64 v1.2.0 / target_sources in its
-  # top-level CMakeLists.txt for the `soft_fp64` target). The fenv TU is
-  # included even though SOFT_FP64_FENV_MODE=0 below makes its bodies
-  # collapse to no-ops - keeps the symbol surface complete.
+  # The list is fixed (matches soft-fp64 v1.3.0 / target_sources in its
+  # top-level CMakeLists.txt for the `soft_fp64` target with SOFT_FP64_OCL=on).
+  # The fenv TU is included even though SOFT_FP64_FENV_MODE=0 below makes its
+  # bodies collapse to no-ops - keeps the symbol surface complete.
   set(_SOFT_FP64_CORE_SOURCES
     src/arithmetic.cpp
     src/classify.cpp
     src/compare.cpp
     src/convert.cpp
     src/fenv.cpp
+    src/ocl.cpp
     src/rounding.cpp
     src/sqrt_fma.cpp
     src/sleef/sleef_exp_log.cpp
@@ -99,7 +100,7 @@ if(WITH_LLVM_TO_METAL)
     if(NOT EXISTS "${_abs}")
       message(FATAL_ERROR
         "soft-fp64 source missing: ${_abs}. Is your soft-fp64 checkout "
-        "at the expected tag (>=v1.2.0)?")
+        "at the expected tag (>=v1.3.0)?")
     endif()
     list(APPEND _SOFT_FP64_ABS_SOURCES "${_abs}")
   endforeach()
@@ -128,7 +129,17 @@ if(WITH_LLVM_TO_METAL)
   # unresolvable. Mode 0 ("disabled") compiles SF64_FE_RAISE to a no-op
   # and removes the thread_local variable. Host-side fenv observability
   # is unaffected (it's surfaced from outside the kernel anyway).
-  list(APPEND METAL_LIBKERNEL_EXTRA_ARGS -DSOFT_FP64_FENV_MODE=0)
+  list(APPEND METAL_LIBKERNEL_EXTRA_ARGS
+       -DSOFT_FP64_FENV_MODE=0
+       -DSOFT_FP64_SNAN_PROPAGATE=0)
+
+  # Build soft-fp64's OpenCL compatibility surface as well. The strict
+  # `sf64_*` ABI remains subnormal-preserving; FTZ is disabled for Metal so
+  # the additive `sf64_ocl_*` / `sf64_native_*` symbols behave the same way
+  # unless AdaptiveCpp explicitly chooses OpenCL FTZ semantics later.
+  list(APPEND METAL_LIBKERNEL_EXTRA_ARGS
+       -DSOFT_FP64_OCL_ENABLED=1
+       -DSOFT_FP64_FTZ_MODE=0)
 
   # Include paths for soft-fp64's relative #includes:
   #   - src/*.cpp              -> "internal*.h"               (sibling, src/)

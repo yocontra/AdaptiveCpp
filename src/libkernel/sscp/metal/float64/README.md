@@ -34,7 +34,7 @@ Resolution order (in `../CMakeLists.txt`):
 
 Hard-fails the configure if the path is unset, missing, or doesn't look
 like a soft-fp64 checkout (no `include/soft_fp64/soft_f64.h`). Required
-soft-fp64 tag: `>=v1.2.0`.
+soft-fp64 tag: `>=v1.3.0`.
 
 soft-fp64's `src/*.cpp` and `src/sleef/*.cpp` are compiled in-place from
 the checkout - no copying, no header rewrites. The build adds three
@@ -52,6 +52,8 @@ soft-fp64 and AdaptiveCpp's own libkernel TUs):
 | `-DACPP_HAS_EXTERNAL_SOFT_FP64` | Elides the `__builtin_trap()` fp64 stub block in `../math.cpp` so the forwarders are the sole definers of every `__acpp_sscp_*_f64` symbol. |
 | `-fno-vectorize -fno-slp-vectorize -fno-unroll-loops` | The Metal source emitter cannot translate `<N x T>` element access or large element-wise shifts on packed vectors to MSL. Keeping libkernel TUs scalar prevents surprise vectorised bodies leaking into MSL. |
 | `-DSOFT_FP64_FENV_MODE=0` | MSL has no `thread_local` storage class. Mode 0 ("disabled") compiles `SF64_FE_RAISE` to a no-op and removes the TLS variable. Host-side IEEE flag observability is unaffected - flags are surfaced from outside the kernel anyway. |
+| `-DSOFT_FP64_SNAN_PROPAGATE=0` | Matches soft-fp64's default `quiet` sNaN policy. |
+| `-DSOFT_FP64_OCL_ENABLED=1 -DSOFT_FP64_FTZ_MODE=0` | Builds soft-fp64's additive OpenCL compatibility/native symbol surface from `src/ocl.cpp`, with FTZ disabled so Metal's opt-in soft-fp64 path remains subnormal-preserving. |
 
 ## Required ABI symbols
 
