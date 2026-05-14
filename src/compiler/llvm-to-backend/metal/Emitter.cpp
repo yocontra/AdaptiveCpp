@@ -712,6 +712,85 @@ inline uint4 __acpp_i128_mul(uint4 a, uint4 b) {
   uint r3 = (uint)c3;
   return uint4(r0, r1, r2, r3);
 }
+
+inline bool __acpp_i128_is_zero(uint4 x) {
+  return x.x == 0u && x.y == 0u && x.z == 0u && x.w == 0u;
+}
+
+inline uint __acpp_i128_get_bit(uint4 x, uint bit) {
+  uint lane = (bit >> 5) & 3u;
+  uint shift = bit & 31u;
+  uint word = (lane == 0u) ? x.x : (lane == 1u) ? x.y : (lane == 2u) ? x.z : x.w;
+  return (word >> shift) & 1u;
+}
+
+inline uint4 __acpp_i128_set_bit(uint4 x, uint bit) {
+  uint lane = (bit >> 5) & 3u;
+  uint mask = 1u << (bit & 31u);
+  if (lane == 0u) {
+    x.x |= mask;
+  } else if (lane == 1u) {
+    x.y |= mask;
+  } else if (lane == 2u) {
+    x.z |= mask;
+  } else {
+    x.w |= mask;
+  }
+  return x;
+}
+
+inline uint4 __acpp_i128_neg(uint4 x) {
+  return __acpp_i128_sub(uint4(0u), x);
+}
+
+// Restoring division with a classic bit-by-bit long division keeps LLVM i128
+// semantics intact. MSL only provides lane-wise vector `/` and `%` for uint4.
+inline uint4 __acpp_i128_udiv(uint4 n, uint4 d) {
+  if (__acpp_i128_is_zero(d)) return uint4(0u);
+
+  uint4 q = uint4(0u);
+  uint4 r = uint4(0u);
+  for (int i = 127; i >= 0; --i) {
+    r = __acpp_i128_shl(r, 1u);
+    r.x |= __acpp_i128_get_bit(n, (uint)i);
+    if (!__acpp_i128_ult(r, d)) {
+      r = __acpp_i128_sub(r, d);
+      q = __acpp_i128_set_bit(q, (uint)i);
+    }
+  }
+  return q;
+}
+
+inline uint4 __acpp_i128_urem(uint4 n, uint4 d) {
+  if (__acpp_i128_is_zero(d)) return uint4(0u);
+
+  uint4 r = uint4(0u);
+  for (int i = 127; i >= 0; --i) {
+    r = __acpp_i128_shl(r, 1u);
+    r.x |= __acpp_i128_get_bit(n, (uint)i);
+    if (!__acpp_i128_ult(r, d)) {
+      r = __acpp_i128_sub(r, d);
+    }
+  }
+  return r;
+}
+
+inline uint4 __acpp_i128_sdiv(uint4 a, uint4 b) {
+  bool neg_a = (a.w & 0x80000000u) != 0u;
+  bool neg_b = (b.w & 0x80000000u) != 0u;
+  uint4 ua = neg_a ? __acpp_i128_neg(a) : a;
+  uint4 ub = neg_b ? __acpp_i128_neg(b) : b;
+  uint4 q = __acpp_i128_udiv(ua, ub);
+  return (neg_a != neg_b) ? __acpp_i128_neg(q) : q;
+}
+
+inline uint4 __acpp_i128_srem(uint4 a, uint4 b) {
+  bool neg_a = (a.w & 0x80000000u) != 0u;
+  uint4 ua = neg_a ? __acpp_i128_neg(a) : a;
+  uint4 ub = ((b.w & 0x80000000u) != 0u) ? __acpp_i128_neg(b) : b;
+  uint4 r = __acpp_i128_urem(ua, ub);
+  return neg_a ? __acpp_i128_neg(r) : r;
+}
 )__";
   os << "\n";
 }
@@ -1472,17 +1551,37 @@ void MetalEmitter::emitBinaryOperator(const BinaryOperator* BO, const std::strin
 
     case Instruction::FDiv:
     case Instruction::UDiv:
-      os << indent(level) << name << " = " << lhs << " / " << rhs << "; " << "// " << instToString(*BO) << "\n";
+      if (BO->getOpcode() == Instruction::UDiv && resultType == "uint4") {
+        os << indent(level) << name << " = __acpp_i128_udiv(" << lhs << ", "
+           << rhs << "); // " << instToString(*BO) << "\n";
+      } else {
+        os << indent(level) << name << " = " << lhs << " / " << rhs << "; " << "// " << instToString(*BO) << "\n";
+      }
       break;
     case Instruction::URem:
-      os << indent(level) << name << " = " << lhs << " % " << rhs << "; " << "// " << instToString(*BO) << "\n";
+      if (resultType == "uint4") {
+        os << indent(level) << name << " = __acpp_i128_urem(" << lhs << ", "
+           << rhs << "); // " << instToString(*BO) << "\n";
+      } else {
+        os << indent(level) << name << " = " << lhs << " % " << rhs << "; " << "// " << instToString(*BO) << "\n";
+      }
       break;
 
     case Instruction::SDiv:
-      os << indent(level) << name << " = as_type<" << resultType << ">((__as_signed(" << lhs << ")) / (__as_signed(" << rhs << ")));\n";
+      if (resultType == "uint4") {
+        os << indent(level) << name << " = __acpp_i128_sdiv(" << lhs << ", "
+           << rhs << "); // " << instToString(*BO) << "\n";
+      } else {
+        os << indent(level) << name << " = as_type<" << resultType << ">((__as_signed(" << lhs << ")) / (__as_signed(" << rhs << ")));\n";
+      }
       break;
     case Instruction::SRem:
-      os << indent(level) << name << " = as_type<" << resultType << ">((__as_signed(" << lhs << ")) % (__as_signed(" << rhs << ")));\n";
+      if (resultType == "uint4") {
+        os << indent(level) << name << " = __acpp_i128_srem(" << lhs << ", "
+           << rhs << "); // " << instToString(*BO) << "\n";
+      } else {
+        os << indent(level) << name << " = as_type<" << resultType << ">((__as_signed(" << lhs << ")) % (__as_signed(" << rhs << ")));\n";
+      }
       break;
     case Instruction::FRem:
       os << indent(level) << name << " = fmod(" << lhs << ", " << rhs << ");\n";
