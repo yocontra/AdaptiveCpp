@@ -246,9 +246,10 @@ if(WITH_METAL_BACKEND OR APPLE)
   target_link_libraries(metal_soft_double PRIVATE Threads::Threads)
   add_sycl_to_target(TARGET metal_soft_double)
   add_test(NAME metal_soft_double COMMAND metal_soft_double)
-  # The opt-in soft-fp64 path can produce large Metal kernels; keep CI from
-  # waiting indefinitely if the driver stalls while compiling or executing one.
-  set_tests_properties(metal_soft_double PROPERTIES LABELS "metal" TIMEOUT 180)
+  # The opt-in soft-fp64 path compiles several large Metal kernels, including
+  # full transcendental coverage. Leave enough room for cold driver JITs while
+  # still bounding genuine stalls.
+  set_tests_properties(metal_soft_double PROPERTIES LABELS "metal" TIMEOUT 600)
 
   add_executable(metal_minnum_maxnum metal_minnum_maxnum.cpp)
   target_include_directories(metal_minnum_maxnum PRIVATE ${Boost_INCLUDE_DIRS})
