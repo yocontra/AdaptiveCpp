@@ -1,6 +1,6 @@
 // HIP fork-safety: outcome depends on the HIP target.
-//   HIP/ROCm  — libhsakmt supports fork-without-exec; child must succeed.
-//   HIP/CUDA  — NVIDIA forbids fork-without-exec; child must see an error
+//   HIP/ROCm  - libhsakmt supports fork-without-exec; child must succeed.
+//   HIP/CUDA  - NVIDIA forbids fork-without-exec; child must see an error
 //               and exit non-zero.
 
 #include <sys/wait.h>
@@ -42,7 +42,7 @@ bool is_hip_device(const sycl::queue &q) {
 int main() {
   sycl::queue q;
   if (!is_hip_device(q)) {
-    std::printf("hip fork-safety: no HIP device — skipping\n");
+    std::printf("hip fork-safety: no HIP device - skipping\n");
     return 0;
   }
 

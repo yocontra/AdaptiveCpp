@@ -1,5 +1,5 @@
 // CUDA fork-safety: loud refusal. The parent submits a kernel, forks, and
-// the child's first dispatch must surface an error — we check via the
+// the child's first dispatch must surface an error - we check via the
 // async exception handler and the kernel result not materializing.
 
 #include <sys/wait.h>
@@ -46,7 +46,7 @@ int submit_expecting_error() {
 int main() {
   sycl::queue q;
   if (!is_cuda_device(q)) {
-    std::printf("cuda fork-safety: no CUDA device — skipping\n");
+    std::printf("cuda fork-safety: no CUDA device - skipping\n");
     return 0;
   }
 

@@ -317,7 +317,7 @@ constant long& constant __acpp_sscp_metal_gpu_to_host_addr_diff [[buffer(1)]];
   // bodies. InstCombine (during the libkernel bitcode build at -O3) can
   // pattern-match soft-fp64 bit-twiddle bodies into calls to LLVM
   // intrinsics, which ReplaceIntrinsics then remaps to `__acpp_sscp_*_f64`
-  // — producing mutual references like `sf64_copysign` calling
+  // - producing mutual references like `sf64_copysign` calling
   // `__acpp_sscp_copysign_f64` calling `sf64_copysign`. Topological sort
   // can't pick an order that satisfies such cycles, so MSL refuses to
   // compile on "use before declaration". Forward decls break the cycle.
@@ -503,7 +503,7 @@ void MetalEmitter::emitEarlyFp64Helpers() {
   // IR-annotated `align 8`, and without the specifier MSL gives this
   // struct 4-byte alignment (max of its uint members). An 8-byte store
   // through a 4-byte-aligned slot is undefined behaviour by the
-  // IR-to-MSL alignment contract — observed as latent corruption risk
+  // IR-to-MSL alignment contract - observed as latent corruption risk
   // during fp64 reduce triage on Apple silicon.
   //
   // Emitted BEFORE emitTypes() so that LLVM struct types containing an
@@ -576,7 +576,7 @@ struct i48u {
 // cases; dynamic amounts (e.g. soft-fp64 mantissa alignment inside div /
 // sqrt) go through these helpers. Shift amount is masked to [0, 128) per
 // LLVM's `shl nuw` / `lshr exact` semantics for well-defined i128 shifts;
-// shifts ≥ 128 yield zero (logical) or -1 (arithmetic with negative x).
+// shifts >= 128 yield zero (logical) or -1 (arithmetic with negative x).
 inline uint4 __acpp_i128_shl(uint4 x, uint s) {
   s &= 127u;
   uint ws = s >> 5;
@@ -659,7 +659,7 @@ inline uint4 __acpp_i128_ashr(uint4 x, uint s) {
 // vector ops; LLVM's `add/sub/mul i128` mandates one 128-bit integer
 // operation with carry / borrow / cross-product propagation across lanes.
 // Emitting `lhs * rhs` for `mul i128` silently corrupts every soft-fp64
-// mantissa multiply (sf64_mul → returns 0 for normal inputs). Same shape
+// mantissa multiply (sf64_mul -> returns 0 for normal inputs). Same shape
 // applies to add/sub. Wrap/two's-complement semantics (i.e. mod 2^128).
 // Lanes are little-endian 32-bit words: x=[0..31] lo, w=[96..127] hi.
 inline uint4 __acpp_i128_add(uint4 a, uint4 b) {
@@ -991,7 +991,7 @@ bool MetalEmitter::emitBasicBlock(const BasicBlock* BB, int level) {
         os << indent(level) << valueName(PHI) << "_in = " << emitExpr(V) << ";\n";
       } else {
         // For aggregate / non-scalar types the integer literal `0` is
-        // not assignable — MSL needs a type-compatible placeholder.
+        // not assignable - MSL needs a type-compatible placeholder.
         // Use `{}` for structs/vectors, `0` for scalar integers,
         // `0.0` for float/acpp_f64 is wrong too; any constant is fine
         // because "undef" means we must not depend on the value.
@@ -1033,7 +1033,8 @@ bool MetalEmitter::emitInstruction(const Instruction& I, int level) {
     }
 
     if (LI->getType()->isPointerTy()) {
-      // ** type, need to use struct slot hack to dereference pointer to pointer
+      // MSL cannot directly represent a generic pointer-to-pointer load, so
+      // use the address-space-specific wrapper slot emitted for this pointer.
       auto elemPhysAS = getPhysicalPointerAddressSpace(LI);
       auto elemAddrSpace = getAddressSpaceKeyword(elemPhysAS);
       auto structName = "__struct_ptr_to_" + elemAddrSpace;
@@ -1052,7 +1053,8 @@ bool MetalEmitter::emitInstruction(const Instruction& I, int level) {
     std::string addrSpace = getAddressSpaceKeyword(physAS);
 
     if (SI->getValueOperand()->getType()->isPointerTy()) {
-      // ** type, need to use struct slot hack to dereference pointer to pointer
+      // MSL cannot directly represent a generic pointer-to-pointer store, so
+      // use the address-space-specific wrapper slot emitted for this pointer.
       auto elemPhysAS = getPhysicalPointerAddressSpace(SI->getValueOperand());
       auto elemAddrSpace = getAddressSpaceKeyword(elemPhysAS);
       auto structName = "__struct_ptr_to_" + elemAddrSpace;
@@ -1188,7 +1190,7 @@ void MetalEmitter::emitUnaryOperator(const UnaryOperator* UO, const std::string&
       // infinite-recurse when the fneg appears INSIDE the body of
       // `sf64_neg` itself: the C++ source `return -a` compiles to
       // `%2 = fneg double %0`, which MetalEmitter would otherwise lower
-      // back to `__acpp_sscp_soft_f64_neg(t0)` → sf64_neg(t0) → fneg → ...
+      // back to `__acpp_sscp_soft_f64_neg(t0)` -> sf64_neg(t0) -> fneg -> ...
       // This cycle silently hangs the GPU on AGX.
       if (UO->getType()->isDoubleTy()) {
         os << indent(level) << name << " = acpp_f64 { (" << operand
@@ -1338,7 +1340,7 @@ bool MetalEmitter::emitCastInstruction(const CastInst* CI, const std::string& na
       // trunc i128 -> i64
       {"uint4", "ulong", "as_type<ulong>({src}.xy)"},
       // zext i1 / i8 / i16 / i32 -> i128. MSL implicitly converts bool to
-      // uint (false→0, true→1), so `(uint){src}` works uniformly across
+      // uint (false->0, true->1), so `(uint){src}` works uniformly across
       // scalar integer sources that fit in 32 bits.
       {"bool",  "uint4", "uint4((uint){src}, 0u, 0u, 0u)"},
       {"uchar", "uint4", "uint4((uint){src}, 0u, 0u, 0u)"},
@@ -1432,7 +1434,7 @@ void MetalEmitter::emitBinaryOperator(const BinaryOperator* BO, const std::strin
     case Instruction::FAdd:
     case Instruction::Add:
       if (BO->getOpcode() == Instruction::Add && resultType == "uint4") {
-        // i128 add — see emitEarlyFp64Helpers. MSL's `uint4 + uint4` is
+        // i128 add - see emitEarlyFp64Helpers. MSL's `uint4 + uint4` is
         // lane-wise (no carry between lanes); LLVM `add i128` requires a
         // single 128-bit integer add mod 2^128.
         os << indent(level) << name << " = __acpp_i128_add(" << lhs << ", "
@@ -1455,7 +1457,7 @@ void MetalEmitter::emitBinaryOperator(const BinaryOperator* BO, const std::strin
     case Instruction::FMul:
     case Instruction::Mul:
       if (BO->getOpcode() == Instruction::Mul && resultType == "uint4") {
-        // i128 mul — see emitEarlyFp64Helpers. MSL's `uint4 * uint4` is
+        // i128 mul - see emitEarlyFp64Helpers. MSL's `uint4 * uint4` is
         // lane-wise (each lane multiplied independently); LLVM `mul i128`
         // requires the schoolbook 4-limb-by-4-limb multiplication mod
         // 2^128. Emitting lane-wise `*` here used to silently corrupt
@@ -1521,9 +1523,9 @@ void MetalEmitter::emitBinaryOperator(const BinaryOperator* BO, const std::strin
              << lanes[1] << "," << lanes[2] << "," << lanes[3] << "); // "
              << instToString(*BO) << "\n";
         } else {
-          // Dynamic shift amount — defer to the i128 shl helper emitted by
+          // Dynamic shift amount - defer to the i128 shl helper emitted by
           // emitEarlyFp64Helpers. `rhs` is itself a uint4 (LLVM %amt is
-          // i128); MSL has no uint4→uint coercion, so take the low lane.
+          // i128); MSL has no uint4->uint coercion, so take the low lane.
           os << indent(level) << name << " = __acpp_i128_shl(" << lhs
              << ", (" << rhs << ").x); // " << instToString(*BO) << "\n";
         }
@@ -1536,7 +1538,7 @@ void MetalEmitter::emitBinaryOperator(const BinaryOperator* BO, const std::strin
         // i128 arithmetic right shift. Same word/bit split as LShr but
         // fills vacated high bits with the sign of x (bit 127 = x.w bit
         // 31). Constant and dynamic amounts both route through the helper
-        // for simplicity — the constant path could be peeled similar to
+        // for simplicity - the constant path could be peeled similar to
         // LShr but soft-fp64 rarely exercises AShr on i128, so the single
         // codepath keeps the emitter surface small.
         os << indent(level) << name << " = __acpp_i128_ashr(" << lhs
@@ -1617,11 +1619,11 @@ void MetalEmitter::emitICmpInstruction(const ICmpInst* IC, const std::string& na
 
   // i128 lowers to `uint4` via mapType (4x uint32). MSL vector-scalar
   // comparison is component-wise and returns `bool4`, but LLVM's icmp
-  // mandates a scalar `i1` result — reduce via all()/any() for eq/ne.
+  // mandates a scalar `i1` result - reduce via all()/any() for eq/ne.
   // Ordered (unsigned/signed lt/gt/le/ge) comparisons on i128 require a
   // proper big-integer comparator and are not emitted by the soft-fp64
   // prelude in practice; report as unsupported rather than silently emit
-  // a component-wise compare that would collapse to `(bool4,bool4)→bool4`.
+  // a component-wise compare that would collapse to `(bool4,bool4)->bool4`.
   Type *opTy = IC->getOperand(0)->getType();
   bool isI128 = opTy->isIntegerTy(128);
 
@@ -1717,13 +1719,13 @@ void MetalEmitter::emitFCmpInstruction(const FCmpInst* FC, const std::string& na
   // pattern-matches its bit-twiddle NaN-check sequence into raw LLVM
   // `fcmp ord` / `fcmp oeq` / `fcmp une` instructions. When MetalEmitter
   // then lowers those back to `__acpp_sscp_soft_f64_fcmp(...)`, the
-  // helper body calls its own forwarder: sf64_fcmp → wrapper → sf64_fcmp →
-  // ... → AGX GPU watchdog hang. The three predicates empirically
+  // helper body calls its own forwarder: sf64_fcmp -> wrapper -> sf64_fcmp ->
+  // ... -> AGX GPU watchdog hang. The three predicates empirically
   // observed inside sf64_fcmp are OEQ (1), ORD (7), and UNE (14); inline
   // each as ulong bit-twiddle when we detect the enclosing function is
   // sf64_fcmp or its wrapper, breaking the cycle. Other predicates inside
   // those functions would indicate a new InstCombine pattern and are
-  // routed back through the helper (likely still cycle — error on the
+  // routed back through the helper (likely still cycle - error on the
   // side of visibility rather than silent hang).
   if (FC->getOperand(0)->getType()->isDoubleTy()) {
     unsigned pred = static_cast<unsigned>(FC->getPredicate());
@@ -2013,7 +2015,7 @@ std::string MetalEmitter::emitExpr(const Value* V) {
     // i128 lowers to uint4 (four 32-bit lanes) via mapType. A wide literal
     // emitted as a single `0x...u` (ulong) paired with a uint4 operand
     // causes MSL to implicitly broadcast the scalar to all lanes *after
-    // truncating to 32 bits* — silently corrupting soft-fp64 mantissa masks
+    // truncating to 32 bits* - silently corrupting soft-fp64 mantissa masks
     // like `and i128 %x, 0xfffffffffff`. Render i128 literals as an
     // explicit `uint4(lo0, lo1, hi0, hi1)` constructor so MSL sees four
     // per-lane values.
@@ -2094,7 +2096,7 @@ std::string MetalEmitter::emitExpr(const Value* V) {
   // `[2 x double] [double 1.000000e+00, double 0.000000e+00]` flowing
   // into a PHI / select / store falls through to `valueName(V)` below,
   // which returns a sanitized name (e.g. `t_double__1_000000e_00__double__0_000000e_00_`)
-  // that is referenced but never declared in the emitted MSL — producing
+  // that is referenced but never declared in the emitted MSL - producing
   // "use of undeclared identifier" Metal compile errors. Reuse the same
   // brace-initializer machinery as the global-constant path so the
   // literal is emitted in-line at every use site.
@@ -2131,7 +2133,7 @@ std::string MetalEmitter::valueName(const Value* V) {
   //    unnamed Value is O(1) amortised against the slot map, instead of
   //    triggering a fresh SlotTracker that walks the entire enclosing
   //    function on every call. Without (2), large soft-fp64 helper
-  //    bodies (sf64_fcmp ~400 lines, sf64_add ~520) blew O(N²) CPU per
+  //    bodies (sf64_fcmp ~400 lines, sf64_add ~520) blew O(N^2) CPU per
   //    function emit and stalled JIT compile for minutes per kernel.
   auto it = valueNameCache.find(V);
   if (it != valueNameCache.end()) {
@@ -2283,7 +2285,7 @@ std::string MetalEmitter::mapType(const Type* T) {
       // operation, but the failing pattern here (`mul`/`lshr`/`trunc`)
       // does not need it. If a future workload trips a signed operation
       // on a promoted width, MetalEmitter will surface a wrong-result
-      // bug, not a JIT failure — at which point a proper LegalizeIntegers
+      // bug, not a JIT failure - at which point a proper LegalizeIntegers
       // pass should be added.
       return typeCache[T] = "ulong";
     } else if (bitWidth > 64 && bitWidth < 128) {
@@ -2476,7 +2478,7 @@ void MetalEmitter::analyzeCallInsts() {
 }
 
 // Scan the module for i64 storage that backs an atomic op (LLVM atomic
-// instructions OR libkernel `__acpp_sscp_atomic_*_{i64,u64}` helpers — the
+// instructions OR libkernel `__acpp_sscp_atomic_*_{i64,u64}` helpers - the
 // SYCL atomic_ref<uint64_t> surface lowers to the helper calls, not to
 // atomicrmw). For every such pointer operand, walk back via
 // stripToRootObject and mark each SSA value along the way as atomic-i64 so
@@ -2592,7 +2594,7 @@ void MetalEmitter::collectVariablesInfo(const Function& F) {
   // valueName() call in the upcoming function emit shares one slot map.
   // Without this, each Value::printAsOperand reconstructs a fresh
   // SlotTracker that walks the entire enclosing Function (O(N) per
-  // call → O(N²) for the function's emit).
+  // call -> O(N^2) for the function's emit).
   currentSlotTracker = std::make_unique<llvm::ModuleSlotTracker>(F.getParent(), false);
   currentSlotTracker->incorporateFunction(F);
 

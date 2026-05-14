@@ -129,14 +129,14 @@ void hip_hardware_manager::reset_after_fork() {
   // detect path or dispatches release() into parent-owned GPU state.
   auto* leaked =
       new std::vector<hip_hardware_context>{std::move(_devices)};
-  (void)leaked; // deliberate leak — parent reclaims at exit
+  (void)leaked; // deliberate leak - parent reclaims at exit
   _devices = std::vector<hip_hardware_context>{};
 
   // hipInit(0) is the explicit reinit entry point. On ROCm this drives
   // libhsakmt's hsakmt_is_forked_child() + clear_after_fork(): the KFD
   // thunk reopens /dev/kfd, clears doorbells/events, and rebuilds the VM
   // aperture for the child. hipErrorNotInitialized simply means the
-  // runtime was never initialized in the parent — nothing to re-init.
+  // runtime was never initialized in the parent - nothing to re-init.
   auto err = hipInit(0);
   if (err != hipSuccess && err != hipErrorNotInitialized) {
     print_warning(

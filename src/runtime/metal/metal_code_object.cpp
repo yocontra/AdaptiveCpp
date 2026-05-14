@@ -91,9 +91,8 @@ bool spawn_xcrun(const std::vector<std::string> &args) {
 
 // Pre-compile MSL to a `.metallib` file via `xcrun metal` + `xcrun metallib`.
 // Loading a `.metallib` via `device->newLibrary(url, ...)` does NOT route
-// through `MTLCompilerService`, which makes the resulting library usable in
-// a forked child (where the parent's MTLCompilerService XPC connection is
-// dead). Returns the absolute path on success, empty string on failure.
+// through in-process source compilation in `MTLCompilerService`. Returns the
+// absolute path on success, empty string on failure.
 std::string compile_msl_to_metallib(const std::string &source,
                                     const std::string &id_str) {
   using namespace common::filesystem;
@@ -238,7 +237,7 @@ std::string locate_archive_builder() {
 
 // Result of spawning `acpp-metal-archive-build`. The runtime distinguishes
 // "success" (load the archive) from "intentionally skipped" (no archive on
-// disk, but not a failure — kernel will JIT in-process at first dispatch in
+// disk, but not a failure - kernel will JIT in-process at first dispatch in
 // each backend) from "failure" (something actually went wrong).
 enum class archive_builder_result {
   // Archive was written to `metalar_path` and should be loaded.
@@ -257,10 +256,8 @@ enum class archive_builder_result {
 // Helper exit-code contract (see src/tools/acpp-metal-archive-build/main.cpp):
 //   0 -> archive written
 //   9 -> intentionally skipped (metallib exceeded ACPP_METAL_ARCHIVE_MAX_BYTES);
-//        no archive produced. Kernel is still functional via in-process JIT in
-//        the original (pre-fork) parent backend; forked children that hit the
-//        same kernel cold will still fail at MTLCompilerService — caller is
-//        responsible for documenting that limitation for skipped libs.
+//        no archive produced. The kernel is still functional via in-process
+//        pipeline creation, but it will not get the archive-backed fast path.
 //   anything else -> real failure
 archive_builder_result spawn_archive_builder(
     const std::string& metallib_path,
@@ -306,10 +303,9 @@ archive_builder_result spawn_archive_builder(
   if (exit_status == 9) {
     // Helper deliberately skipped this metallib. Surface a single warning
     // naming the metallib + the override knob so the user can opt back in if
-    // they have headroom. The kernels will still work in the parent backend
-    // via in-process JIT at first dispatch; forked workers that hit a skipped
-    // kernel cold will still crash at MTLCompilerService — that's a known
-    // tradeoff documented in CLAUDE.md (MTLBinaryArchive cache).
+    // they have headroom. The kernels still work via in-process pipeline
+    // creation at first dispatch, but they do not get the archive-backed fast
+    // path.
     std::error_code ec;
     auto sz = std::filesystem::file_size(metallib_path, ec);
     HIPSYCL_DEBUG_WARNING
@@ -327,8 +323,7 @@ archive_builder_result spawn_archive_builder(
 }
 
 // Load an already-serialized `.metalar` file into an MTL::BinaryArchive.
-// Safe in a forked child: deserialization does not route through
-// MTLCompilerService.
+// Deserialization does not route through MTLCompilerService.
 MTL::BinaryArchive* load_binary_archive_from_url(MTL::Device* device,
                                                  const std::string& metalar_path) {
   if (!device) return nullptr;
@@ -440,8 +435,7 @@ result metal_sscp_executable_object::build(const std::string& source) {
     // Load a previously-serialized archive if present; otherwise spawn the
     // helper subprocess to produce one and load the result. Failure is
     // non-fatal: _archive stays nullptr and the pipeline-state path falls
-    // through to in-process compile (which will fail on a forked child, but
-    // is useful for diagnostics on the parent).
+    // through to in-process creation.
     std::error_code ec;
     if (std::filesystem::exists(metalar_path, ec) && !ec) {
       _archive = load_binary_archive_from_url(_device, metalar_path);
@@ -460,8 +454,7 @@ result metal_sscp_executable_object::build(const std::string& source) {
       case archive_builder_result::skipped:
         // Intentional skip (e.g. metallib too large). _archive stays nullptr;
         // the kernel-launch path falls back to in-process pipeline-state
-        // creation (works in parent backend, will fail on forked children for
-        // this specific kernel — known tradeoff, logged once above).
+        // creation for this specific kernel.
         break;
       case archive_builder_result::failed:
         // Real failure. _archive stays nullptr; the warning was already

@@ -13,7 +13,7 @@
 //
 // Every symbol below is one of the "Required primitives" listed in
 // ./README.md (the ABI contract). Each body is a one-line forward to the
-// matching `sf64_*` entry point — no local arithmetic, no host FPU
+// matching `sf64_*` entry point - no local arithmetic, no host FPU
 // dependency, no SYCL-isms.
 //
 // soft-fp64 is consumed via `-DACPP_SOFT_FP64_SRC_DIR=<path>` (see the
@@ -43,7 +43,7 @@ HIPSYCL_SSCP_BUILTIN double __acpp_sscp_soft_f64_div(double a, double b) {
     return sf64_div(a, b);
 }
 // LLVM `frem` (fmod semantics: sign of result = sign of dividend); maps to
-// sf64_rem. sf64_fmod is documented as identical semantics — pick one.
+// sf64_rem. sf64_fmod is documented as identical semantics - pick one.
 HIPSYCL_SSCP_BUILTIN double __acpp_sscp_soft_f64_rem(double a, double b) {
     return sf64_rem(a, b);
 }
@@ -118,7 +118,7 @@ HIPSYCL_SSCP_BUILTIN unsigned short __acpp_sscp_soft_f64_to_u16(double a) {
 
 // ---- Compare ---------------------------------------------------------------
 // sf64_fcmp takes the same LLVM FCmpInst::Predicate encoding (0..15) that
-// the Metal SSCP emitter uses — see Emitter.cpp:1321. Pass-through forward.
+// the Metal SSCP emitter uses - see Emitter.cpp:1321. Pass-through forward.
 
 HIPSYCL_SSCP_BUILTIN int __acpp_sscp_soft_f64_fcmp(double lhs, double rhs, int pred) {
     return sf64_fcmp(lhs, rhs, pred);

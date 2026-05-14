@@ -11,7 +11,7 @@
 //
 // Forwarder TU: AdaptiveCpp Metal SSCP fp64 math library -> soft-fp64 sf64_*.
 //
-// Optional surface — when present, these preempt the `__builtin_trap()`
+// Optional surface - when present, these preempt the `__builtin_trap()`
 // stubs in ../math.cpp at bitcode link time. The canonical symbol list
 // lives in ./README.md. Every entry below is either a 1:1 forward to an
 // `sf64_*` entry point or a documented short composite.
@@ -102,7 +102,7 @@ HIPSYCL_SSCP_BUILTIN double __acpp_sscp_fma_f64(double a, double b, double c) {
 }
 // OpenCL `mad`: a*b + c with implementation-defined precision. Forwarding to
 // sf64_fma gives deterministic, correctly-rounded semantics (stricter than
-// OpenCL requires — legal).
+// OpenCL requires - legal).
 HIPSYCL_SSCP_BUILTIN double __acpp_sscp_mad_f64(double a, double b, double c) {
     return sf64_fma(a, b, c);
 }

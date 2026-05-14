@@ -22,7 +22,7 @@ if(WITH_LLVM_TO_METAL)
     # SSCP emitter calls. These two files live in this tree (they ARE
     # AdaptiveCpp's ABI; they have nothing to do with soft-fp64's
     # public surface). The actual sf64_* implementation comes from
-    # soft-fp64 — see ACPP_SOFT_FP64_SRC_DIR below.
+    # soft-fp64 - see ACPP_SOFT_FP64_SRC_DIR below.
     float64/acpp_soft_fp64_primitives.cpp
     float64/acpp_soft_fp64_math.cpp)
 
@@ -32,7 +32,7 @@ if(WITH_LLVM_TO_METAL)
   # Apple GPUs do not implement IEEE 754 fp64 in hardware. The Metal SSCP
   # emitter rewrites every `llvm.<op>.f64` and fp64 arith / cmp / convert op
   # to a call to `__acpp_sscp_*_f64` or `__acpp_sscp_soft_f64_*`. Those
-  # symbols MUST resolve at libkernel-bitcode link time — soft-fp64 is the
+  # symbols MUST resolve at libkernel-bitcode link time - soft-fp64 is the
   # implementation that provides them via the two forwarder TUs above.
   #
   # Resolution order for ACPP_SOFT_FP64_SRC_DIR:
@@ -42,7 +42,7 @@ if(WITH_LLVM_TO_METAL)
   #
   # Whatever path resolves must point at the *root* of a soft-fp64 checkout
   # (the dir containing `include/`, `src/`, `src/sleef/`). soft-fp64's
-  # `.cpp` files are compiled in-place from that tree — no copying, no
+  # `.cpp` files are compiled in-place from that tree - no copying, no
   # rewriting of `#include "../../include/..."` lines, no flattening. The
   # required tag is `v1.2.0`; soft-fp64 maintains semver, so newer
   # `v1.x` tags are also accepted.
@@ -63,7 +63,7 @@ if(WITH_LLVM_TO_METAL)
       "soft-fp64 checkout (tag >=v1.2.0). Set "
       "-DACPP_SOFT_FP64_SRC_DIR=<abs path> or env ACPP_SOFT_FP64_SRC_DIR. "
       "AdaptiveCpp's Metal libkernel cannot link without an fp64 "
-      "implementation — Apple GPUs lack hardware fp64.")
+      "implementation - Apple GPUs lack hardware fp64.")
   endif()
   if(NOT IS_DIRECTORY "${ACPP_SOFT_FP64_SRC_DIR}")
     message(FATAL_ERROR
@@ -79,7 +79,7 @@ if(WITH_LLVM_TO_METAL)
   # The list is fixed (matches soft-fp64 v1.2.0 / target_sources in its
   # top-level CMakeLists.txt for the `soft_fp64` target). The fenv TU is
   # included even though SOFT_FP64_FENV_MODE=0 below makes its bodies
-  # collapse to no-ops — keeps the symbol surface complete.
+  # collapse to no-ops - keeps the symbol surface complete.
   set(_SOFT_FP64_CORE_SOURCES
     src/arithmetic.cpp
     src/classify.cpp
@@ -113,18 +113,18 @@ if(WITH_LLVM_TO_METAL)
   # `__acpp_sscp_*_f64` symbol. Always on now (soft-fp64 is mandatory).
   list(APPEND METAL_LIBKERNEL_EXTRA_ARGS -DACPP_HAS_EXTERNAL_SOFT_FP64)
 
-  # Vectorisation / unrolling control — APPLIES TO ALL libkernel TUs in
+  # Vectorisation / unrolling control - APPLIES TO ALL libkernel TUs in
   # this list (including the AdaptiveCpp-native ones), not just soft-fp64.
   # This is broader than strictly required, but the Metal source emitter
   # (`compiler/llvm-to-backend/metal/Emitter.cpp`) cannot translate
   # `<N x T>` element access or large element-wise shifts on packed
   # vectors to MSL, so keeping every TU scalar avoids surprise vectorised
   # code paths leaking into MSL via libkernel inlining. The cost is small
-  # — these are mostly cold thunks.
+  # - these are mostly cold thunks.
   list(APPEND METAL_LIBKERNEL_EXTRA_ARGS -fno-vectorize -fno-slp-vectorize -fno-unroll-loops)
 
   # soft-fp64's `tls` fenv mode uses `thread_local` for IEEE flag
-  # accumulation. MSL has no TLS — the resulting TLS wrapper is
+  # accumulation. MSL has no TLS - the resulting TLS wrapper is
   # unresolvable. Mode 0 ("disabled") compiles SF64_FE_RAISE to a no-op
   # and removes the thread_local variable. Host-side fenv observability
   # is unaffected (it's surfaced from outside the kernel anyway).
@@ -137,7 +137,7 @@ if(WITH_LLVM_TO_METAL)
   #                               "../internal_fenv.h"        (relative, OK as-is)
   #                               "sleef_fe_macros.h"         (sibling)
   #   - src/sleef/sleef_*.h    -> "../../include/soft_fp64/foo.h" (resolves naturally
-  #                                from src/sleef/ — soft-fp64 root has include/)
+  #                                from src/sleef/ - soft-fp64 root has include/)
   list(APPEND METAL_LIBKERNEL_EXTRA_ARGS
        -I "${ACPP_SOFT_FP64_SRC_DIR}/include"
        -I "${ACPP_SOFT_FP64_SRC_DIR}/src"

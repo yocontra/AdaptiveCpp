@@ -114,7 +114,7 @@ void ze_backend::fail_if_forked() const {
           error_type::runtime_error});
 
   // Rearm so subsequent dispatches in the same child don't spam the same
-  // error. The backend state stays abandoned — this child cannot recover.
+  // error. The backend state stays abandoned - this child cannot recover.
   _fork_guard.rearm();
 }
 

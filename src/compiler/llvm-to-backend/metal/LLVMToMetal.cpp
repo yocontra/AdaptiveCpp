@@ -127,10 +127,10 @@ struct ReplaceIntrinsics : llvm::PassInfoMixin<ReplaceIntrinsics> {
     }
   }
 
-  // Soft-fp64 cycle guard. Remapping `llvm.fabs.f64` → `__acpp_sscp_fabs_f64`
+  // Soft-fp64 cycle guard. Remapping `llvm.fabs.f64` -> `__acpp_sscp_fabs_f64`
   // (and similar for copysign, etc.) becomes an infinite mutual recursion
   // when the intrinsic appears inside a function that is itself one side of
-  // the remap chain — either the replacement target (`__acpp_sscp_fabs_f64`)
+  // the remap chain - either the replacement target (`__acpp_sscp_fabs_f64`)
   // or the soft-fp64 body it forwards to (`sf64_fabs`). Hit path: the
   // libkernel bitcode is compiled at `-O3`, clang's InstCombine pattern-
   // matches sf64_fabs's hand-written bit-twiddle `(x & ~sign_bit)` into a
@@ -146,7 +146,7 @@ struct ReplaceIntrinsics : llvm::PassInfoMixin<ReplaceIntrinsics> {
   // rather than renaming the call. This breaks the cycle at its root without
   // touching the remap for all other (user-kernel) callers.
   //
-  // Only fabs and copysign participate in this cycle in practice — InstCombine
+  // Only fabs and copysign participate in this cycle in practice - InstCombine
   // can't pattern-match scalar bit ops into transcendentals. The helper below
   // is only invoked for those two.
   static bool isCycleRiskyCaller(const llvm::Function* Parent,
@@ -155,7 +155,7 @@ struct ReplaceIntrinsics : llvm::PassInfoMixin<ReplaceIntrinsics> {
     // Case 1: the call is inside the replacement target itself.
     if (Parent->getName() == ReplacementName) return true;
     // Case 2: the call is inside the matching soft-fp64 body that the
-    // replacement forwards to. `__acpp_sscp_<op>_f64` ↔ `sf64_<op>`.
+    // replacement forwards to. `__acpp_sscp_<op>_f64` <-> `sf64_<op>`.
     const std::string acpp_prefix = "__acpp_sscp_";
     const std::string f64_suffix = "_f64";
     if (ReplacementName.compare(0, acpp_prefix.size(), acpp_prefix) == 0 &&
@@ -249,14 +249,14 @@ struct ReplaceIntrinsics : llvm::PassInfoMixin<ReplaceIntrinsics> {
           if (isCycleRiskyCaller(Parent, ReplacementName)) {
             if (inlineLowerCycleRiskyIntrinsic(CI, Name)) {
               HIPSYCL_DEBUG_INFO
-                  << "Metal: ReplaceIntrinsics: cycle guard — inline-lowered "
+                  << "Metal: ReplaceIntrinsics: cycle guard - inline-lowered "
                   << Name << " inside " << Parent->getName().str() << "\n";
             } else {
-              // Can't inline-lower — leave it; a later pass (ExpandIntrinsics
+              // Can't inline-lower - leave it; a later pass (ExpandIntrinsics
               // or LLVM's default intrinsic lowering at codegen) must handle
               // it. Remapping here would create the recursion cycle.
               HIPSYCL_DEBUG_INFO
-                  << "Metal: ReplaceIntrinsics: cycle guard — SKIPPING "
+                  << "Metal: ReplaceIntrinsics: cycle guard - SKIPPING "
                   << Name << " inside " << Parent->getName().str()
                   << " (no inline lowering available)\n";
             }
@@ -442,7 +442,7 @@ struct ExpandIntrinsics : llvm::PassInfoMixin<ExpandIntrinsics> {
     llvm::Value* IsNorm = B.CreateAnd(
         B.CreateICmpUGE(Abs, Const(MinNorm)),
         B.CreateICmpULT(Abs, Const(InfBits)));
-    // sNaN (bit 0) vs qNaN (bit 1): IEEE 754-2008 standard rule —
+    // sNaN (bit 0) vs qNaN (bit 1): IEEE 754-2008 standard rule -
     // qNaN has the most-significant mantissa bit set, sNaN has it clear.
     llvm::Value* MantHighSet = B.CreateICmpNE(
         B.CreateAnd(Abs, Const(MantHigh)), Const(0));
@@ -720,7 +720,7 @@ bool LLVMToMetalTranslator::toBackendFlavor(llvm::Module &M, PassHandler& PH) {
   // instruction referencing those symbols. Consequences without
   // intervention:
   //   * `LinkOnlyNeeded=true` (the default) doesn't pull the soft-fp64
-  //     bodies into M — nothing "needs" them from M's perspective.
+  //     bodies into M - nothing "needs" them from M's perspective.
   //   * Even if we force-link, GlobalInliningAttributorPass marks every
   //     non-kernel function as `alwaysinline`+InternalLinkage; the
   //     inliner finds no call sites; and O3 DCE removes the bodies.
@@ -794,21 +794,21 @@ bool LLVMToMetalTranslator::toBackendFlavor(llvm::Module &M, PassHandler& PH) {
     // `ReplaceIntrinsics` can produce. Without this, an `llvm.fabs.f64`
     // (or `llvm.sqrt.f64`, `llvm.copysign.f64`, etc.) introduced by
     // InstCombine pattern-matching AFTER the first link pass gets remapped
-    // to `__acpp_sscp_fabs_f64` — a symbol the linker never imported
+    // to `__acpp_sscp_fabs_f64` - a symbol the linker never imported
     // because the call site didn't exist at link time. The result is a
-    // use-of-undeclared-identifier MSL compile failure downstream.
+    // use-of-undeclared-identifier failure during MSL compilation.
     //
     // Signatures derive from the `llvm.<name>.f64` intrinsic each forwarder
     // replaces: all entries in `remapped_llvm_math_builtins` except
-    // `atan2`, `ldexp`, and `copysign` are unary (double → double); those
+    // `atan2`, `ldexp`, and `copysign` are unary (double -> double); those
     // three plus `remapped_llvm_math_builtins_renamed` (minnum/maxnum/pow
-    // → fmin/fmax/powr) are binary with the noted special cases.
+    // -> fmin/fmax/powr) are binary with the noted special cases.
     static const struct {
       const char* llvm_name;
       bool is_binary;
       bool second_is_int;
     } kMathForwarders[] = {
-        // unary f64 forwarders (double → double)
+        // unary f64 forwarders (double -> double)
         {"sin",    false, false}, {"cos",    false, false},
         {"tan",    false, false}, {"sqrt",   false, false},
         {"asin",   false, false}, {"acos",   false, false},
@@ -821,13 +821,13 @@ bool LLVMToMetalTranslator::toBackendFlavor(llvm::Module &M, PassHandler& PH) {
         {"exp10",  false, false},
         {"fabs",   false, false}, {"floor",  false, false},
         {"ceil",   false, false},
-        // binary f64 forwarders (double, double) → double
+        // binary f64 forwarders (double, double) -> double
         {"atan2",    true, false},
         {"copysign", true, false},
         {"fmax",     true, false}, // from llvm.maxnum.f64
         {"fmin",     true, false}, // from llvm.minnum.f64
         {"powr",     true, false}, // from llvm.pow.f64
-        // binary (double, int) → double
+        // binary (double, int) -> double
         {"ldexp", true, true},
     };
     llvm::Type* dTy = llvm::Type::getDoubleTy(M.getContext());
@@ -843,7 +843,7 @@ bool LLVMToMetalTranslator::toBackendFlavor(llvm::Module &M, PassHandler& PH) {
       if (auto* F = llvm::dyn_cast<llvm::Function>(Callee.getCallee()))
         PreLinkUsed.push_back(F);
     }
-    // `llvm.fmuladd.f64` → `__acpp_sscp_fma_f64` (double, double, double).
+    // `llvm.fmuladd.f64` -> `__acpp_sscp_fma_f64` (double, double, double).
     {
       auto* FT = llvm::FunctionType::get(dTy, {dTy, dTy, dTy}, false);
       auto Callee = M.getOrInsertFunction("__acpp_sscp_fma_f64", FT);
@@ -874,17 +874,17 @@ bool LLVMToMetalTranslator::toBackendFlavor(llvm::Module &M, PassHandler& PH) {
     // `sf64_*` are the core soft-fp64 bodies these forwarders call into.
     // Preserve them too: O3's InstCombine pattern-matches their bit-
     // twiddle implementations back into LLVM intrinsics (e.g. the
-    // `(x & ~sign) | (y & sign)` copysign pattern → `llvm.copysign.f64`
-    // → `__acpp_sscp_copysign_f64`), creating a self-call loop.
+    // `(x & ~sign) | (y & sign)` copysign pattern -> `llvm.copysign.f64`
+    // -> `__acpp_sscp_copysign_f64`), creating a self-call loop.
     bool isSoftF64Core = Name.find("sf64_") == 0;
     if (!isSoftF64Primitive && !isF64MathForwarder && !isSoftF64Core) continue;
 
     // Helpers with a pointer output parameter (frexp, modf, fract,
-    // lgamma_r, sincos, …) take a caller-stack int*/double* that lives
+    // lgamma_r, sincos, ...) take a caller-stack int*/double* that lives
     // in AS 5 (thread). MSL has no generic pointer, so the Emitter's
     // emitted signature `sf64_frexp(double, device void*)` can't accept
     // a thread pointer from the caller. The only way to propagate the
-    // caller's AS through is to inline the helper into the caller — then
+    // caller's AS through is to inline the helper into the caller - then
     // LLVM's InferAddressSpacesPass (run after inlining below) can see
     // the alloca-rooted pointer and specialise the internal stores.
     //
@@ -894,7 +894,7 @@ bool LLVMToMetalTranslator::toBackendFlavor(llvm::Module &M, PassHandler& PH) {
     // concrete thread-AS load/store there.
     //
     // This is safe for pointer-param helpers because their bodies are
-    // write-through-output-ptr + ordinary arithmetic — InstCombine has
+    // write-through-output-ptr + ordinary arithmetic - InstCombine has
     // no intrinsic to pattern-match them into (there is no
     // `llvm.frexp.f64` that would collapse the body). The copysign /
     // fma / fmin self-call loop that motivated `noinline` only affects
@@ -1001,17 +1001,17 @@ bool LLVMToMetalTranslator::translateToBackendFormat(llvm::Module& FlavoredModul
     // emits in AS 0. Without a second inference pass they stay in AS 0
     // and MetalEmitter's emitGlobalConstants (which emits AS 4 constants
     // with MSL's `constexpr constant` keyword) skips them, producing
-    // use-of-undeclared-identifier errors downstream.
+    // use-of-undeclared-identifier errors during MSL compilation.
     AddressSpaceInferencePass{getAddressSpaceMap()}.run(FlavoredModule, MAM);
 
     llvm::AlwaysInlinerPass{}.run(FlavoredModule, MAM);
 
     // Third AS inference sweep. Pointer-parameter soft-fp64 helpers
-    // (frexp, modf, fract, lgamma_r, sincos, …) carry `alwaysinline`
+    // (frexp, modf, fract, lgamma_r, sincos, ...) carry `alwaysinline`
     // per the post-link preservation tweak above, so the AlwaysInliner
     // just inlined their bodies into the callers. Those inlined bodies
     // now reach back to the caller's alloca-rooted pointer (AS 5 =
-    // thread) without crossing a function boundary — which is exactly
+    // thread) without crossing a function boundary - which is exactly
     // the shape LLVM's InferAddressSpacesPass can propagate through.
     // Without this third sweep the inlined load/store instructions
     // keep their post-inlining AS-0 pointer operand type, and the
@@ -1075,13 +1075,13 @@ bool LLVMToMetalTranslator::translateToBackendFormat(llvm::Module& FlavoredModul
     //   1. The kernel functions themselves.
     //   2. Every `__acpp_sscp_soft_f64_*` primitive (add/sub/mul/div/rem/
     //      neg/fcmp/fmin_precise/fmax_precise/from_*/to_*). These are
-    //      EMITTER-IMPLICIT — MetalEmitter emits calls to them as TEXT
+    //      EMITTER-IMPLICIT - MetalEmitter emits calls to them as TEXT
     //      directly from `fadd double`, `fcmp double`, fp64 cast/conv IR
     //      instructions in the kernel body; the IR itself has no `call`
     //      to them, so a pure CallBase walk wouldn't find them. Seed them
     //      unconditionally; their bodies (`sf64_add` etc.) come along
     //      transitively. Math forwarders like `__acpp_sscp_sin_f64` are
-    //      NOT in this set — they're invoked from the IR via direct
+    //      NOT in this set - they're invoked from the IR via direct
     //      calls (after ReplaceIntrinsics), so the BFS picks them up
     //      only when the kernel actually uses them.
     for (llvm::Function& F : FlavoredModule) {
@@ -1107,7 +1107,7 @@ bool LLVMToMetalTranslator::translateToBackendFormat(llvm::Module& FlavoredModul
         }
       }
     }
-    // Drop unreachable soft-fp64 surface functions only — leave other
+    // Drop unreachable soft-fp64 surface functions only - leave other
     // AdaptiveCpp libkernel functions alone.
     llvm::SmallVector<llvm::Function*, 64> drop;
     for (llvm::Function& F : FlavoredModule) {

@@ -122,7 +122,7 @@ private:
   std::unordered_set<const llvm::Value*> atomicI64Values;
 
   // Cache for valueName(). With the per-function ModuleSlotTracker below,
-  // each first-time slot lookup is O(1) amortised — but identical-Value
+  // each first-time slot lookup is O(1) amortised - but identical-Value
   // queries from emit/declare/HL-tree paths still benefit from skipping
   // the printAsOperand + string-cleaning round trip. Cleared at the
   // start of each emitFunction.
@@ -131,7 +131,7 @@ private:
   // Per-function slot tracker reused by valueName(). Without this,
   // llvm::Value::printAsOperand constructs a fresh SlotTracker on every
   // call that walks the whole enclosing Function to assign slot numbers
-  // — O(N²) over a single function emit, which on soft-fp64's larger
+  // - O(N^2) over a single function emit, which on soft-fp64's larger
   // helper bodies (sf64_fcmp ~400 IR lines, sf64_add ~520) chews CPU
   // for minutes per kernel JIT. Recreated in collectVariablesInfo for
   // the function being emitted; the unique_ptr breaks the include

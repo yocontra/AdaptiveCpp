@@ -1,4 +1,4 @@
-# Vendored metal-float64 — maintenance notes
+# Vendored metal-float64 - maintenance notes
 
 ## Upstream snapshot
 
@@ -19,11 +19,11 @@ Only the four public headers from `Sources/MetalFloat64/include/MetalFloat64/`:
 
 The following upstream directories/files were deliberately **not** vendored:
 
-    Sources/MetalFloat64/src/Atomic.metal       — stub (`increment(x) { return x+1; }`)
-    Sources/MetalFloat64/tests/*.metal           — test harnesses, not production
-    Sources/MetalAtomic64/                       — separate sub-package, not f64 math
-    Package.swift, build.sh, build.swift        — Swift Package Manager driver
-    README.md                                    — unnecessary; use this file
+    Sources/MetalFloat64/src/Atomic.metal       - stub (`increment(x) { return x+1; }`)
+    Sources/MetalFloat64/tests/*.metal           - test harnesses, not production
+    Sources/MetalAtomic64/                       - separate sub-package, not f64 math
+    Package.swift, build.sh, build.swift        - Swift Package Manager driver
+    README.md                                    - unnecessary; use this file
 
 ## State of upstream (as of 2026-04-20)
 
@@ -70,5 +70,5 @@ libkernel:
 - Replace `metal::isnan` / `metal::isinf` / etc. with the already-wired
   `__acpp_sscp_isnan_f32` etc. where applicable, or `__builtin_isnan`.
 - Replace `metal::select(a, b, cond)` with a plain ternary.
-- Keep `ALWAYS_INLINE` / `NOINLINE` / `EXPORT` from `Defines.h` — they map to
+- Keep `ALWAYS_INLINE` / `NOINLINE` / `EXPORT` from `Defines.h` - they map to
   standard GCC attributes and work under the libkernel Clang front-end.

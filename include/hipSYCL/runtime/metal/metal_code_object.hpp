@@ -42,10 +42,9 @@ public:
 
   // Per-library MTLBinaryArchive containing pre-compiled AGX machine code
   // for every exported kernel. Owned by the executable object; may be null
-  // if archive build failed (e.g. forked child without MTLCompilerService
-  // access and no cached .metalar on disk). Used at pipeline-state creation
-  // with MTLPipelineOptionFailOnBinaryArchiveMiss to avoid post-fork XPC
-  // lookups to MTLCompilerService.
+  // if archive build failed or was skipped. Used at pipeline-state creation
+  // with MTLPipelineOptionFailOnBinaryArchiveMiss to avoid in-process
+  // compilation through MTLCompilerService when the archive is complete.
   virtual MTL::BinaryArchive* get_binary_archive() const = 0;
 };
 

@@ -12,8 +12,8 @@
 // acpp-metal-archive-build: subprocess helper that produces a serialized
 // MTLBinaryArchive (.metalar) from a compiled .metallib + a list of kernel
 // names. Called by the Metal backend from metal_sscp_executable_object::build
-// when it needs to materialize an archive for a forked child to load via
-// newBinaryArchive(url) without re-entering MTLCompilerService.
+// when it needs to materialize an archive that pipeline creation can consume
+// without re-entering MTLCompilerService.
 //
 // This tool runs in a fresh process (and therefore has its own live
 // MTLCompilerService XPC connection), so AIR->AGX compilation via
@@ -40,11 +40,10 @@ namespace {
 // + st_length under SLEEF lowering) emit 1.1+ MB metallibs whose AGX pipeline
 // states OOM the helper at addComputePipelineFunctions / serializeToURL with
 // SIGKILL exit 137. When that happens the parent runtime sees a generic crash
-// and falls back to the next-startup MTLCompilerService path — which crashes
-// in forked children. This threshold makes the helper exit gracefully (exit 9)
-// before the OOM, signalling to the runtime that pipeline-state archival was
-// skipped on purpose so it can either accept slower in-process JIT or gate the
-// kernel out for the current backend. Override with ACPP_METAL_ARCHIVE_MAX_BYTES.
+// and falls back to the in-process MTLCompilerService path. This threshold
+// makes the helper exit gracefully (exit 9) before the OOM, signalling to the
+// runtime that pipeline-state archival was skipped on purpose so it can accept
+// slower in-process JIT. Override with ACPP_METAL_ARCHIVE_MAX_BYTES.
 constexpr long long DEFAULT_MAX_METALLIB_BYTES = 900 * 1024;  // 900 KiB
 
 long long get_metallib_size_limit() {

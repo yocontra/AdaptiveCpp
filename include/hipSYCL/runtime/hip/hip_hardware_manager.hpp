@@ -87,7 +87,7 @@ public:
   // hip_allocator / hip_event_pool, which hold per-device hipStream_t and
   // hipEvent_t handles inherited from the parent) and re-enumerate against
   // the current process. Called by hip_backend::reset_after_fork_internal()
-  // on the child side of fork() — hipInit drives libhsakmt's KFD re-attach
+  // on the child side of fork() - hipInit drives libhsakmt's KFD re-attach
   // as a side effect.
   void reset_after_fork();
 

@@ -107,7 +107,7 @@ void metal_backend::reset_after_fork_internal() const {
   //     without destroying so the leaks stay localized to this one event.
   //  2. Abandon the multi_queue_executor: it holds metal_inorder_queue
   //     objects with MTLCommandQueue / MTLSharedEvent / SharedEventListener
-  //     — release() into those walks parent-process IOGPUDevice memory.
+  //     - release() into those walks parent-process IOGPUDevice memory.
   //  3. Reset the hardware manager: abandon the inherited MTLDevice and
   //     allocator state, then re-enumerate enough device information for the
   //     child to produce a controlled allocation refusal.

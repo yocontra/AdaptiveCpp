@@ -67,7 +67,7 @@ ACPP_SSCP_MAP_METAL_FLOAT_BUILTIN(fabs)
 ACPP_SSCP_MAP_METAL_FLOAT_BUILTIN2(copysign)
 ACPP_SSCP_MAP_METAL_FLOAT_BUILTIN3(fma)
 // fmin/fmax: IEEE 754-2008 NaN + signed-zero semantics. Defined explicitly
-// below (not via ACPP_SSCP_MAP_METAL_FLOAT_BUILTIN2) — MSL's native fmin/fmax
+// below (not via ACPP_SSCP_MAP_METAL_FLOAT_BUILTIN2) - MSL's native fmin/fmax
 // under -ffast-math treat -0 == +0 and may drop the NaN guard, so the macro
 // passthrough would lose both contracts at the call site.
 HIPSYCL_SSCP_BUILTIN i32 __acpp_sscp_isnan_f32(f32 x);
@@ -356,13 +356,13 @@ ACPP_SSCP_MAP_METAL_HALF_BINOP(div, /)
 //
 // Each stub below is declared so the linker is satisfied. Bodies call
 // __builtin_trap() because the vendored metal-float64 library at
-// ./float64/ has no actual soft-double arithmetic — upstream was abandoned
+// ./float64/ has no actual soft-double arithmetic - upstream was abandoned
 // in 2023 after only shipping the `float64_t` skeleton class.
 //
 // When an external soft-fp64 implementation is linked in via
 // ACPP_METAL_EXTERNAL_FP64_DIR, the build defines
 // ACPP_HAS_EXTERNAL_SOFT_FP64 and the entire f64 trap-stub block is
-// elided — the real bodies come from the external TUs and `llvm-link`
+// elided - the real bodies come from the external TUs and `llvm-link`
 // sees exactly one definition per symbol. Without the guard, duplicate
 // definitions would error out `llvm-link` at libkernel-bitcode link.
 // See ./float64/README.md for the ABI contract.

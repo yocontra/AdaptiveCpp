@@ -271,8 +271,7 @@ metal_hardware_context::metal_hardware_context(MTL::Device* device)
   // Soft-double via metal-float64 compiles on every Metal device (no HW
   // dependency) but costs ~1/32x native fp32 throughput, so it must be
   // explicitly opted into. Read env once per context (not a function-local
-  // static) so that forked children rebuilt via reset_after_fork() observe
-  // their own process env rather than the parent's baked-in value.
+  // static) so rebuilt contexts observe the current process environment.
   if (const char *v = std::getenv("ACPP_METAL_ENABLE_SOFT_FP64"))
     _soft_fp64_enabled = (std::string_view{v} == "1");
 
@@ -376,7 +375,7 @@ bool metal_hardware_context::has(device_support_aspect aspect) const {
     // (load/store/exchange/add/sub/min/max). Threadgroup-scope i64 atomics
     // and cmpxchg/and/or/xor are NOT supported by the hardware. If a
     // threadgroup-atomic aspect is ever added to device_support_aspect, the
-    // default-false branch below rejects it safely — do NOT pattern-match
+    // default-false branch below rejects it safely - do NOT pattern-match
     // any new atomic64 variant onto this branch without re-reading MSL 2.4.
     return _supports_atomic64;
   default:
@@ -735,7 +734,7 @@ void metal_hardware_manager::rebuild_devices(
     if (devices) devices->release();
     // Deliberate: no CPU fallback. Leaving _devices empty causes
     // get_num_devices() == 0, which the runtime surfaces as "no Metal
-    // device available" — callers handle that cleanly.
+    // device available" - callers handle that cleanly.
     HIPSYCL_DEBUG_WARNING
       << "metal_hardware_manager: MTLCopyAllDevices returned no devices\n";
     return;

@@ -611,7 +611,7 @@ result metal_inorder_queue::submit_memcpy(memcpy_operation& op, const dag_node_p
 
     command_buffer->addCompletedHandler([](MTL::CommandBuffer* cb) {
       if (NS::Error* err = cb->error()) {
-        std::string msg = "metal_queue: Memcpy (device→host) failed: ";
+        std::string msg = "metal_queue: Memcpy (device->host) failed: ";
         if (err->localizedDescription()) msg += err->localizedDescription()->utf8String();
         register_error(make_error(__acpp_here(), error_info{msg}));
       }
