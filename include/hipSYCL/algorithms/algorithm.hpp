@@ -30,6 +30,7 @@
 #include "hipSYCL/algorithms/util/allocation_cache.hpp"
 #include "hipSYCL/algorithms/util/memory_streaming.hpp"
 #include "hipSYCL/algorithms/sort/bitonic_sort.hpp"
+#include "hipSYCL/algorithms/sort/sort_into.hpp"
 #include "hipSYCL/algorithms/merge/merge.hpp"
 #include "hipSYCL/algorithms/scan/scan.hpp"
 
