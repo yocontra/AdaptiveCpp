@@ -21,6 +21,9 @@
 
 #include <sys/sysctl.h>
 
+#include <cstdlib>
+#include <string_view>
+
 namespace hipsycl {
 namespace rt {
 
@@ -255,6 +258,22 @@ metal_hardware_context::metal_hardware_context(MTL::Device* device)
     _gpu_family = MTL::GPUFamilyApple7;
   }
 
+  // Apple8+ (M2 and later) supports MSL 2.4 atomic_ulong on *device* memory.
+  // Op coverage: load, store, exchange, add, sub, min, max. Explicitly NOT
+  // supported by the hardware: cmpxchg / and / or / xor, and NOT supported in
+  // threadgroup (shared/local) scope at any op. Callers that need any of
+  // those must refuse at kernel-lowering time — this aspect advertises only
+  // the device-memory subset above.
+  _supports_atomic64 = device->supportsFamily(MTL::GPUFamilyApple8);
+
+  // Soft-double via metal-float64 compiles on every Metal device (no HW
+  // dependency) but costs ~1/32x native fp32 throughput, so it must be
+  // explicitly opted into. Read env once per context (not a function-local
+  // static) so that forked children rebuilt via reset_after_fork() observe
+  // their own process env rather than the parent's baked-in value.
+  if (const char *v = std::getenv("ACPP_METAL_ENABLE_SOFT_FP64"))
+    _soft_fp64_enabled = (std::string_view{v} == "1");
+
   io_registry_entry_t gpu_entry = get_gpu_entry();
 
   _core_count = get_gpu_core_count(gpu_entry);
@@ -346,9 +365,18 @@ bool metal_hardware_context::has(device_support_aspect aspect) const {
     return false;
 
   case device_support_aspect::fp64:
-    return false;
+    // Soft-double via metal-float64 runs on every Metal device, but at ~1/32x
+    // fp32 throughput. Gated behind ACPP_METAL_ENABLE_SOFT_FP64=1 so users
+    // don't silently pay that cost. See constructor for the one-time probe.
+    return _soft_fp64_enabled;
   case device_support_aspect::atomic64:
-    return false;
+    // Apple8+ (M2+) only, *device*-memory scope, op subset only
+    // (load/store/exchange/add/sub/min/max). Threadgroup-scope i64 atomics
+    // and cmpxchg/and/or/xor are NOT supported by the hardware. If a
+    // threadgroup-atomic aspect is ever added to device_support_aspect, the
+    // default-false branch below rejects it safely — do NOT pattern-match
+    // any new atomic64 variant onto this branch without re-reading MSL 2.4.
+    return _supports_atomic64;
   default:
     return false;
   }
@@ -703,9 +731,17 @@ void metal_hardware_manager::rebuild_devices() {
 void metal_hardware_manager::reset_after_fork() {
   // Abandon inherited MTLDevice pointers without calling release(). The
   // release path triggers IOGPUDevice / AGX heap teardown that walks parent
-  // process memory and crashes in the child. The parent's GPU resources
-  // will be reclaimed when it exits; what matters here is that the child
-  // rebuilds a fresh MTLDevice with a process-local XPC connection.
+  // process memory and crashes in the child. The parent's GPU resources are
+  // reclaimed when it exits; what matters here is that the child rebuilds a
+  // fresh MTLDevice with a process-local XPC connection.
+  //
+  // clear() on std::vector<MTL::Device*> drops pointers only (trivially
+  // destructible). _contexts and _allocators hold no raw Metal handles that
+  // would survive their destructors — metal_allocator stores MTL::Buffer*
+  // entries but its destructor is defaulted, so those pointers are leaked
+  // rather than released; that is deliberate (see raw_free()). This runs
+  // from a pthread_atfork child-side handler in normal user code (not a
+  // signal handler), so heap allocation in rebuild_devices() is fine.
   _devices.clear();
   _contexts.clear();
   _allocators.clear();

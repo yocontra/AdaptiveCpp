@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.12)
 project(adaptivecpp-tests)
+enable_testing()
 
 set(Boost_USE_STATIC_LIBS off)
 set(BUILD_SHARED_LIBS on)
@@ -224,3 +225,52 @@ if(WITH_PCUDA_TESTS)
 endif()
 
 add_subdirectory(compiler)
+
+add_subdirectory(fork_safety)
+
+# Metal-specific backend correctness tests. Gated on either WITH_METAL_BACKEND
+# (if propagated from the top-level build) or APPLE (same gating pattern that
+# fork_safety/metal.cpp uses — the tests themselves runtime-skip when no Metal
+# device is present). Each test is tagged with the `metal` CTest label so
+# users can run `ctest -L metal` to target only this suite.
+if(WITH_METAL_BACKEND OR APPLE)
+  add_executable(metal_atomic64 metal_atomic64.cpp)
+  target_include_directories(metal_atomic64 PRIVATE ${Boost_INCLUDE_DIRS})
+  target_link_libraries(metal_atomic64 PRIVATE Threads::Threads)
+  add_sycl_to_target(TARGET metal_atomic64)
+  add_test(NAME metal_atomic64 COMMAND metal_atomic64)
+  set_tests_properties(metal_atomic64 PROPERTIES LABELS "metal")
+
+  add_executable(metal_soft_double metal_soft_double.cpp)
+  target_include_directories(metal_soft_double PRIVATE ${Boost_INCLUDE_DIRS})
+  target_link_libraries(metal_soft_double PRIVATE Threads::Threads)
+  add_sycl_to_target(TARGET metal_soft_double)
+  add_test(NAME metal_soft_double COMMAND metal_soft_double)
+  set_tests_properties(metal_soft_double PROPERTIES LABELS "metal")
+
+  add_executable(metal_minnum_maxnum metal_minnum_maxnum.cpp)
+  target_include_directories(metal_minnum_maxnum PRIVATE ${Boost_INCLUDE_DIRS})
+  target_link_libraries(metal_minnum_maxnum PRIVATE Threads::Threads)
+  # -ffast-math exercises fmin/fmax NaN propagation under aggressive FP
+  # optimizations, where LLVM is most likely to rewrite calls to minnum/maxnum.
+  target_compile_options(metal_minnum_maxnum PRIVATE -ffast-math)
+  add_sycl_to_target(TARGET metal_minnum_maxnum)
+  add_test(NAME metal_minnum_maxnum COMMAND metal_minnum_maxnum)
+  set_tests_properties(metal_minnum_maxnum PROPERTIES LABELS "metal")
+
+  add_executable(metal_bitonic_sort metal_bitonic_sort.cpp)
+  target_include_directories(metal_bitonic_sort PRIVATE ${Boost_INCLUDE_DIRS})
+  target_link_libraries(metal_bitonic_sort PRIVATE Threads::Threads)
+  add_sycl_to_target(TARGET metal_bitonic_sort)
+  add_test(NAME metal_bitonic_sort COMMAND metal_bitonic_sort)
+  set_tests_properties(metal_bitonic_sort PROPERTIES LABELS "metal")
+
+  add_executable(metal_ooq metal_ooq.cpp)
+  target_include_directories(metal_ooq PRIVATE ${Boost_INCLUDE_DIRS})
+  target_link_libraries(metal_ooq PRIVATE Threads::Threads)
+  add_sycl_to_target(TARGET metal_ooq)
+  add_test(NAME metal_ooq COMMAND metal_ooq)
+  # 30s CTest ceiling: the test has its own 10s in-process deadline; this
+  # catches truly stuck dispatchers.
+  set_tests_properties(metal_ooq PROPERTIES LABELS "metal" TIMEOUT 30)
+endif()

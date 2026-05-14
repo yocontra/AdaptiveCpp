@@ -144,6 +144,7 @@ bool MetalEmitter::emit(std::string& out) {
   PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
   analyzeCallInsts();
+  analyzeAtomicI64Storage();
 
   os << R"__(
 #include <metal_stdlib>
@@ -424,6 +425,18 @@ void MetalEmitter::emitIntrinsicHelpers() {
   }
 )__";
 
+  // Change 2: soft-double fp64 representation. Metal GPUs don't natively
+  // support fp64, so we lower every LLVM `double` op to a call into the
+  // __acpp_sscp_soft_f64_* library (provided by the libkernel agent).
+  // Storage representation: two uint halves to sidestep MSL alignment
+  // quirks on ulong (and keep the struct trivially memcpy-able).
+  os << R"__(
+struct acpp_f64 {
+  uint lo;
+  uint hi;
+};
+)__";
+
   os << R"__(
 struct i48u {
   packed_ushort3 w;
@@ -558,6 +571,14 @@ bool MetalEmitter::emitDeclarations() {
   for (auto &[AI, idx] : sortedAllocas) {
     Type *allocTy = dyn_cast<AllocaInst>(AI)->getAllocatedType();
     auto typeName = mapType(allocTy);
+    // Change 1: if this alloca backs an atomic i64 (SYCL atomic_ref<uint64_t>
+    // or LLVM atomicrmw on i64), promote storage to `atomic_ulong` so the
+    // libkernel helper's `__atomic_pointer_cast<long>` cast lands on
+    // layout-compatible storage.
+    if (atomicI64Values.count(AI) && allocTy->isIntegerTy() &&
+        allocTy->getIntegerBitWidth() == 64) {
+      typeName = "atomic_ulong";
+    }
     os << indent(1) << typeName << " local" << idx << ";\n";
   }
   os << "\n";
@@ -885,6 +906,25 @@ void MetalEmitter::emitUnaryOperator(const UnaryOperator* UO, const std::string&
   switch (UO->getOpcode()) {
     case Instruction::FNeg: {
       std::string operand = emitExpr(UO->getOperand(0));
+      // Change 2: soft-double fneg. Cannot use `-x` on acpp_f64.
+      if (UO->getType()->isDoubleTy()) {
+        // TODO(acpp-soft-fp64): __acpp_sscp_soft_f64_neg
+        os << indent(level) << name << " = __acpp_sscp_soft_f64_neg("
+           << operand << "); // " << instToString(*UO) << "\n";
+        break;
+      }
+      if (auto* VT = dyn_cast<FixedVectorType>(UO->getType())) {
+        if (VT->getElementType()->isDoubleTy()) {
+          // TODO(acpp-soft-fp64): element-wise unroll for <N x double> fneg
+          unsigned N = VT->getNumElements();
+          for (unsigned i = 0; i < N; ++i) {
+            os << indent(level) << name << "[" << i
+               << "] = __acpp_sscp_soft_f64_neg(" << operand << "[" << i
+               << "]); // " << instToString(*UO) << "\n";
+          }
+          break;
+        }
+      }
       os << indent(level) << name << " = -" << operand << "; " << "// " << instToString(*UO) << "\n";
       break;
     }
@@ -899,6 +939,104 @@ bool MetalEmitter::emitCastInstruction(const CastInst* CI, const std::string& na
   auto destType = mapType(CI->getDestTy());
   std::string src = emitExpr(CI->getOperand(0));
   auto srcType = mapType(CI->getSrcTy());
+
+  // Change 2: soft-double conversions. Any cast touching fp64 (source or
+  // destination) is lowered to a libkernel helper. Integer widths 32/64 are
+  // first-class; narrower integers round-trip via i32.
+  // TODO(acpp-soft-fp64): symbols referenced below provided by libkernel.
+  auto isF64Ty = [](llvm::Type* T) { return T->isDoubleTy(); };
+  auto intBits = [](llvm::Type* T) -> unsigned {
+    return T->isIntegerTy() ? T->getIntegerBitWidth() : 0u;
+  };
+
+  if (isF64Ty(CI->getDestTy()) || isF64Ty(CI->getSrcTy())) {
+    llvm::Type* DT = CI->getDestTy();
+    llvm::Type* ST = CI->getSrcTy();
+    switch (CI->getOpcode()) {
+      case Instruction::FPExt: {
+        // float -> double
+        os << indent(level) << name << " = __acpp_sscp_soft_f64_from_f32("
+           << src << "); // " << instToString(*CI) << "\n";
+        return true;
+      }
+      case Instruction::FPTrunc: {
+        // double -> float
+        os << indent(level) << name << " = __acpp_sscp_soft_f64_to_f32("
+           << src << "); // " << instToString(*CI) << "\n";
+        return true;
+      }
+      case Instruction::FPToSI: {
+        // double -> iN
+        unsigned bits = intBits(DT);
+        if (bits == 32 || bits == 64) {
+          os << indent(level) << name << " = __acpp_sscp_soft_f64_to_i"
+             << bits << "(" << src << "); // " << instToString(*CI) << "\n";
+        } else {
+          os << indent(level) << name
+             << " = (" << destType
+             << ") __acpp_sscp_soft_f64_to_i32(" << src << "); // "
+             << instToString(*CI) << "\n";
+        }
+        return true;
+      }
+      case Instruction::FPToUI: {
+        unsigned bits = intBits(DT);
+        if (bits == 32 || bits == 64) {
+          os << indent(level) << name << " = __acpp_sscp_soft_f64_to_u"
+             << bits << "(" << src << "); // " << instToString(*CI) << "\n";
+        } else {
+          os << indent(level) << name
+             << " = (" << destType
+             << ") __acpp_sscp_soft_f64_to_u32(" << src << "); // "
+             << instToString(*CI) << "\n";
+        }
+        return true;
+      }
+      case Instruction::SIToFP: {
+        unsigned bits = intBits(ST);
+        if (bits == 32 || bits == 64) {
+          os << indent(level) << name << " = __acpp_sscp_soft_f64_from_i"
+             << bits << "(__as_signed(" << src << ")); // "
+             << instToString(*CI) << "\n";
+        } else {
+          os << indent(level) << name
+             << " = __acpp_sscp_soft_f64_from_i32((int)__as_signed(" << src
+             << ")); // " << instToString(*CI) << "\n";
+        }
+        return true;
+      }
+      case Instruction::UIToFP: {
+        unsigned bits = intBits(ST);
+        if (bits == 32 || bits == 64) {
+          os << indent(level) << name << " = __acpp_sscp_soft_f64_from_u"
+             << bits << "(" << src << "); // " << instToString(*CI) << "\n";
+        } else {
+          os << indent(level) << name
+             << " = __acpp_sscp_soft_f64_from_u32((uint)" << src
+             << "); // " << instToString(*CI) << "\n";
+        }
+        return true;
+      }
+      case Instruction::BitCast: {
+        // i64 <-> double: rebuild via lo/hi halves. Use as_type<uint2>(ulong)
+        // to split, and pack back with ((ulong)hi << 32) | lo.
+        if (isF64Ty(DT) && intBits(ST) == 64) {
+          os << indent(level) << name
+             << " = acpp_f64 { as_type<uint2>(" << src << ").x, as_type<uint2>("
+             << src << ").y }; // " << instToString(*CI) << "\n";
+          return true;
+        }
+        if (isF64Ty(ST) && intBits(DT) == 64) {
+          os << indent(level) << name << " = (((ulong)" << src << ".hi) << 32) | (ulong)"
+             << src << ".lo; // " << instToString(*CI) << "\n";
+          return true;
+        }
+        // Fall through to generic BitCast handling for other mixes.
+        break;
+      }
+      default: break;
+    }
+  }
 
   auto emitUint4Cast = [&]() -> bool {
     struct CastEntry {
@@ -962,6 +1100,44 @@ void MetalEmitter::emitBinaryOperator(const BinaryOperator* BO, const std::strin
   std::string rhs = emitExpr(BO->getOperand(1));
 
   std::string resultType = mapType(BO->getType());
+
+  // Change 2: soft-double lowering. Any BinaryOperator whose result type is
+  // double (scalar or <N x double>) is lowered to a call into the
+  // __acpp_sscp_soft_f64_* library. The libkernel agent provides these
+  // symbols in parallel — linker will complain until they land (expected).
+  auto softF64Sym = [](unsigned Opcode) -> const char* {
+    switch (Opcode) {
+      case Instruction::FAdd: return "__acpp_sscp_soft_f64_add";
+      case Instruction::FSub: return "__acpp_sscp_soft_f64_sub";
+      case Instruction::FMul: return "__acpp_sscp_soft_f64_mul";
+      case Instruction::FDiv: return "__acpp_sscp_soft_f64_div";
+      case Instruction::FRem: return "__acpp_sscp_soft_f64_rem";
+      default: return nullptr;
+    }
+  };
+
+  if (BO->getType()->isDoubleTy()) {
+    if (const char* sym = softF64Sym(BO->getOpcode())) {
+      // TODO(acpp-soft-fp64): __acpp_sscp_soft_f64_{add,sub,mul,div,rem}
+      os << indent(level) << name << " = " << sym << "(" << lhs << ", "
+         << rhs << "); // " << instToString(*BO) << "\n";
+      return;
+    }
+  }
+  if (auto* VT = dyn_cast<FixedVectorType>(BO->getType())) {
+    if (VT->getElementType()->isDoubleTy()) {
+      if (const char* sym = softF64Sym(BO->getOpcode())) {
+        // TODO(acpp-soft-fp64): element-wise unroll for <N x double>
+        unsigned N = VT->getNumElements();
+        for (unsigned i = 0; i < N; ++i) {
+          os << indent(level) << name << "[" << i << "] = " << sym << "("
+             << lhs << "[" << i << "], " << rhs << "[" << i << "]); // "
+             << instToString(*BO) << "\n";
+        }
+        return;
+      }
+    }
+  }
 
   switch (BO->getOpcode()) {
     case Instruction::FAdd:
@@ -1113,6 +1289,35 @@ void MetalEmitter::emitFCmpInstruction(const FCmpInst* FC, const std::string& na
   std::string lhs = emitExpr(FC->getOperand(0));
   std::string rhs = emitExpr(FC->getOperand(1));
 
+  // Change 2: soft-double comparison. Route through a single soft-float
+  // fcmp helper keyed by the LLVM FCmpInst::Predicate enum value.
+  // The libkernel agent provides __acpp_sscp_soft_f64_fcmp(lhs, rhs, pred)
+  // returning bool with the same semantics as LLVM's fcmp for predicate
+  // 0..15 (from FCMP_FALSE to FCMP_TRUE).
+  if (FC->getOperand(0)->getType()->isDoubleTy()) {
+    // TODO(acpp-soft-fp64): __acpp_sscp_soft_f64_fcmp(a, b, predicate)
+    //   predicate values follow llvm::FCmpInst::Predicate (uchar 0..15).
+    unsigned pred = static_cast<unsigned>(FC->getPredicate());
+    os << indent(level) << name << " = __acpp_sscp_soft_f64_fcmp(" << lhs
+       << ", " << rhs << ", " << pred << "u); // " << instToString(*FC)
+       << "\n";
+    return;
+  }
+  if (auto* VT = dyn_cast<FixedVectorType>(FC->getOperand(0)->getType())) {
+    if (VT->getElementType()->isDoubleTy()) {
+      // TODO(acpp-soft-fp64): element-wise fcmp unroll for <N x double>
+      unsigned N = VT->getNumElements();
+      unsigned pred = static_cast<unsigned>(FC->getPredicate());
+      for (unsigned i = 0; i < N; ++i) {
+        os << indent(level) << name << "[" << i
+           << "] = __acpp_sscp_soft_f64_fcmp(" << lhs << "[" << i << "], "
+           << rhs << "[" << i << "], " << pred << "u); // "
+           << instToString(*FC) << "\n";
+      }
+      return;
+    }
+  }
+
   switch (FC->getPredicate()) {
     case FCmpInst::FCMP_OEQ:
       os << indent(level) << name << " = (" << lhs << " == " << rhs << ");\n";
@@ -1248,6 +1453,49 @@ bool MetalEmitter::emitCallInstruction(const CallInst* CI, const std::string& na
     return emitMetalInlineCall(CI, name, level);
   }
 
+  // Change 3: IEEE-correct NaN-propagating fmin/fmax to kill the pg_accel
+  // `-ffast-math` workaround. LLVM's llvm.minnum.f32 / llvm.maxnum.f32 are
+  // renamed by ReplaceIntrinsics (LLVMToMetal.cpp) to __acpp_sscp_fmin_f32 /
+  // __acpp_sscp_fmax_f32. Under -ffast-math, InstCombine may drop the
+  // `nnan` contract, and Metal's `metal::fmin` is undefined on NaN in
+  // fast-math mode. We emit an explicit NaN-propagating sequence inline:
+  //   (isnan(a) ? b : (isnan(b) ? a : metal::fmin(a, b)))
+  // For f64 we can't use metal::fmin directly (no native f64 on Metal —
+  // see Change 2 for soft-fp64 lowering). Route to a libkernel precise
+  // variant that propagates NaN in soft-float.
+  if (CI->arg_size() == 2) {
+    const char* msl_op = nullptr;
+    bool is_f32 = false;
+    bool is_f64 = false;
+    if (calleeName == "__acpp_sscp_fmin_f32") { msl_op = "metal::fmin"; is_f32 = true; }
+    else if (calleeName == "__acpp_sscp_fmax_f32") { msl_op = "metal::fmax"; is_f32 = true; }
+    else if (calleeName == "__acpp_sscp_fmin_f64") { is_f64 = true; }
+    else if (calleeName == "__acpp_sscp_fmax_f64") { is_f64 = true; }
+
+    if (is_f32) {
+      std::string a = emitExpr(CI->getArgOperand(0));
+      std::string b = emitExpr(CI->getArgOperand(1));
+      os << indent(level) << name << " = (isnan(" << a << ") ? (" << b
+         << ") : (isnan(" << b << ") ? (" << a << ") : " << msl_op
+         << "(" << a << ", " << b << "))); // " << instToString(*CI) << "\n";
+      return true;
+    }
+    if (is_f64) {
+      // TODO(acpp-soft-fp64): libkernel agent provides
+      //   __acpp_sscp_soft_f64_fmin_precise / __acpp_sscp_soft_f64_fmax_precise
+      // (NaN-propagating soft-float fmin/fmax). Symbol names stable; this
+      // call may show as an unresolved extern until that lands.
+      const char* soft_sym = (calleeName == "__acpp_sscp_fmin_f64")
+                                 ? "__acpp_sscp_soft_f64_fmin_precise"
+                                 : "__acpp_sscp_soft_f64_fmax_precise";
+      std::string a = emitExpr(CI->getArgOperand(0));
+      std::string b = emitExpr(CI->getArgOperand(1));
+      os << indent(level) << name << " = " << soft_sym << "(" << a << ", "
+         << b << "); // " << instToString(*CI) << "\n";
+      return true;
+    }
+  }
+
   int argsSize = CI->arg_size();
   if (callee->isDeclaration()) {
     auto returnType = callee->getReturnType();
@@ -1288,6 +1536,17 @@ std::string MetalEmitter::emitExpr(const Value* V) {
   }
 
   if (auto *CF = dyn_cast<ConstantFP>(V)) {
+    // Change 2: fp64 literal -> acpp_f64 struct initializer. Bit-pattern
+    // via the APFloat raw bits so denormals/NaN/Inf round-trip exactly.
+    if (CF->getType()->isDoubleTy()) {
+      double dv = CF->getValue().convertToDouble();
+      uint64_t bits; memcpy(&bits, &dv, sizeof(bits));
+      uint32_t lo = static_cast<uint32_t>(bits);
+      uint32_t hi = static_cast<uint32_t>(bits >> 32);
+      std::ostringstream hex;
+      hex << "acpp_f64 { 0x" << std::hex << lo << "u, 0x" << hi << "u }";
+      return hex.str();
+    }
     float floatVal = CF->getValue().convertToFloat();
     uint32_t val; memcpy(&val, &floatVal, sizeof(float));
     std::ostringstream hex;
@@ -1397,6 +1656,19 @@ std::string MetalEmitter::mapType(const Type* T) {
     return typeCache[T] = "array<" + elemType + ", " + std::to_string(AT->getNumElements()) + ">";
   }
 
+  // Change 2: auto-vectorized fp64 kernels may produce <N x double>. Lower
+  // as a fixed-length array so that the element-wise op lowering in the
+  // emit*Operator paths can index it directly. Restricted to fp64 element
+  // types only; full generic vector lowering is a separate effort.
+  // TODO(acpp-vector-lowering): generalize to non-fp64 vectors.
+  if (auto *VT = dyn_cast<FixedVectorType>(T)) {
+    if (VT->getElementType()->isDoubleTy()) {
+      auto elemType = mapType(VT->getElementType());
+      return typeCache[T] = "array<" + elemType + ", " +
+                            std::to_string(VT->getNumElements()) + ">";
+    }
+  }
+
   if (auto *ST = dyn_cast<StructType>(T)) {
     if (ST->hasName()) {
       auto str = ST->getName().str();
@@ -1440,8 +1712,8 @@ std::string MetalEmitter::mapType(const Type* T) {
   } else if (T->isFloatTy()) {
     return typeCache[T] = "float";
   } else if (T->isDoubleTy()) {
-    errorMsg = "Error: Double type is not supported on Metal GPU\n";
-    return "";
+    // Change 2: soft-double lowering. See acpp_f64 helper at emitIntrinsicHelpers.
+    return typeCache[T] = "acpp_f64";
   } else if (T->isHalfTy()) {
     return typeCache[T] = "half";
   } else {
@@ -1611,6 +1883,111 @@ void MetalEmitter::analyzeCallInsts() {
         mapType(returnType);
         for (auto& Arg : Callee->args()) {
           mapType(Arg.getType());
+        }
+      }
+    }
+  }
+}
+
+// Change 1: scan the module for i64 storage that backs an atomic op
+// (LLVM atomic instructions OR libkernel `__acpp_sscp_atomic_*_{i64,u64}`
+// helpers — the SYCL atomic_ref<uint64_t> surface lowers to the helper
+// calls, not to atomicrmw). For every such pointer operand, walk back via
+// stripToRootObject and mark each SSA value along the way as atomic-i64 so
+// that mapType emits `atomic_ulong` for the storage declaration.
+void MetalEmitter::analyzeAtomicI64Storage() {
+  auto markChain = [this](const llvm::Value* V) {
+    // Walk bitcasts / addrspacecasts / trivial GEPs back to the root object,
+    // marking every intermediate SSA value so valuesToDeclare picks up the
+    // atomic type when the value is declared. stripToRootObject already
+    // handles this traversal; we replicate its walk here so we can mark
+    // every step, not just the final root.
+    const llvm::Value* Cur = V;
+    while (true) {
+      atomicI64Values.insert(Cur);
+      if (auto* ASC = llvm::dyn_cast<llvm::AddrSpaceCastInst>(Cur)) {
+        Cur = ASC->getPointerOperand();
+        continue;
+      }
+      if (auto* BC = llvm::dyn_cast<llvm::BitCastInst>(Cur)) {
+        Cur = BC->getOperand(0);
+        continue;
+      }
+      if (auto* GEP = llvm::dyn_cast<llvm::GetElementPtrInst>(Cur)) {
+        bool allZero = true;
+        for (auto it = GEP->idx_begin(); it != GEP->idx_end(); ++it) {
+          if (auto* CI = llvm::dyn_cast<llvm::ConstantInt>(*it)) {
+            if (!CI->isZero()) { allZero = false; break; }
+          } else {
+            allZero = false;
+            break;
+          }
+        }
+        if (allZero) {
+          Cur = GEP->getPointerOperand();
+          continue;
+        }
+      }
+      break;
+    }
+  };
+
+  auto isI64 = [](llvm::Type* T) {
+    return T->isIntegerTy() && T->getIntegerBitWidth() == 64;
+  };
+
+  for (auto& F : M) {
+    if (F.isDeclaration()) continue;
+    for (auto& BB : F) {
+      for (auto& I : BB) {
+        // Native LLVM atomic ops.
+        if (auto* RMW = llvm::dyn_cast<llvm::AtomicRMWInst>(&I)) {
+          if (isI64(RMW->getValOperand()->getType())) {
+            markChain(RMW->getPointerOperand());
+          }
+          continue;
+        }
+        if (auto* CX = llvm::dyn_cast<llvm::AtomicCmpXchgInst>(&I)) {
+          if (isI64(CX->getNewValOperand()->getType())) {
+            markChain(CX->getPointerOperand());
+          }
+          continue;
+        }
+        if (auto* LI = llvm::dyn_cast<llvm::LoadInst>(&I)) {
+          if (LI->isAtomic() && isI64(LI->getType())) {
+            markChain(LI->getPointerOperand());
+          }
+          continue;
+        }
+        if (auto* SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+          if (SI->isAtomic() && isI64(SI->getValueOperand()->getType())) {
+            markChain(SI->getPointerOperand());
+          }
+          continue;
+        }
+        // SYCL atomic surface: libkernel helpers.
+        // Naming convention (see src/libkernel/sscp/*/atomic.cpp):
+        //   __acpp_sscp_atomic_<op>_i64  / _u64
+        //   __acpp_sscp_cmp_exch_{weak,strong}_i64 / _u64
+        //   __acpp_sscp_atomic_fetch_<op>_i64 / _u64
+        if (auto* CI = llvm::dyn_cast<llvm::CallInst>(&I)) {
+          llvm::Function* Callee = CI->getCalledFunction();
+          if (!Callee) continue;
+          llvm::StringRef Name = Callee->getName();
+          bool isAtomicHelper =
+              (Name.starts_with("__acpp_sscp_atomic_") ||
+               Name.starts_with("__acpp_sscp_cmp_exch_"));
+          if (!isAtomicHelper) continue;
+          bool i64Suffix = Name.ends_with("_i64") || Name.ends_with("_u64");
+          if (!i64Suffix) continue;
+          // The pointer argument is conventionally the first `T*` argument.
+          // Mark every pointer-typed argument to be safe (cmpxchg has two).
+          for (unsigned i = 0; i < CI->arg_size(); ++i) {
+            llvm::Value* Arg = CI->getArgOperand(i);
+            if (Arg->getType()->isPointerTy()) {
+              markChain(Arg);
+            }
+          }
         }
       }
     }

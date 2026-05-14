@@ -1,0 +1,28 @@
+metal-float64 vendored code
+===========================
+
+This directory contains source files vendored from the metal-float64 project:
+
+  Upstream:   https://github.com/philipturner/metal-float64
+  Author:     Philip Turner
+  License:    MIT (see LICENSE)
+
+The vendored files are derived works of the upstream headers under the
+`Sources/MetalFloat64/include/MetalFloat64/` tree:
+
+  Defines.h        — utility attribute macros (ALWAYS_INLINE, NOINLINE, EXPORT)
+  Double.h         — declares `metal_float64::float64_t` skeleton class
+  Vector.h         — declares `metal_float64::vec<T, N>` template skeleton
+  MetalFloat64.h   — umbrella header
+
+Upstream attribution notice (from MetalFloat64.h):
+
+  MetalFloat64 directly copies some code from the Metal Standard Library.
+  This is the copyright notice embedded in the Metal Standard Library.
+      -*- Metal -*-
+      ===-- metal_stdlib ------------------------------===
+      Copyright (c) 2014-2020 Apple Inc. All rights reserved
+      ===------------------------------------------------===
+
+No binary artifacts or Metal Standard Library source files are redistributed by
+AdaptiveCpp; only the thin wrapper headers above are vendored.

@@ -80,6 +80,7 @@ private:
   std::string mapType(const llvm::Value* V);
   std::string getAddressSpaceKeyword(unsigned AS);
   void analyzeCallInsts();
+  void analyzeAtomicI64Storage();
   void collectVariablesInfo(const llvm::Function& F);
   unsigned getPhysicalPointerAddressSpace(const llvm::Value* V);
   const llvm::Value* stripToRootObject(const llvm::Value* V);
@@ -107,6 +108,13 @@ private:
   std::unordered_map<const llvm::Value*, std::string> valuesToDeclare;
   //
   std::unordered_map<const llvm::Value*, unsigned> inferredPtrAS;
+
+  // Change 1: set of SSA values whose i64 storage backs an atomic_ref<uint64_t>
+  // (or equivalent SYCL atomic i64 op). mapType(Value*) consults this to emit
+  // `atomic_ulong` instead of `ulong` for the storage declaration so the
+  // `__atomic_pointer_cast<long>` pointer reinterpret lands on MSL
+  // `atomic<long>`-compatible storage.
+  std::unordered_set<const llvm::Value*> atomicI64Values;
 
   int inputStructCounter = 0;
   std::string inputStructName;

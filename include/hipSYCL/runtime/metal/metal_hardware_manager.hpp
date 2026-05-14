@@ -59,6 +59,12 @@ private:
   uint64_t _slc_size;
   uint64_t _max_allocated_size;
   int _gpu_family;
+  // Cached aspect probes. Populated once in the constructor so has() is a
+  // pure member read and never re-enters the Metal runtime. Stored per
+  // context (not a function-local static) so forked children rebuilt via
+  // reset_after_fork() observe the current-process Metal device and env.
+  bool _supports_atomic64 = false;
+  bool _soft_fp64_enabled = false;
 };
 
 class metal_hardware_manager : public backend_hardware_manager
@@ -70,9 +76,11 @@ public:
   virtual device_id get_device_id(std::size_t index) const override;
   virtual std::size_t get_num_platforms() const override;
 
-  // Release the inherited MTLDevice (and everything built on top of it) and
-  // re-enumerate. Used by metal_backend::reset_after_fork() so the child side
-  // of fork() gets a fresh MTLDevice with its own process-local XPC link.
+  // Abandon (do NOT release) the inherited MTLDevice and everything built on
+  // top of it, then re-enumerate. Used by metal_backend::reset_after_fork()
+  // so the child side of fork() gets a fresh MTLDevice with its own
+  // process-local XPC link. Calling release() on the parent's handles would
+  // walk dead XPC / IOGPUDevice state and crash the child.
   void reset_after_fork();
 
   virtual ~metal_hardware_manager();

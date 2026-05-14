@@ -323,3 +323,160 @@ ACPP_SSCP_MAP_METAL_HALF_BINOP(add, +)
 ACPP_SSCP_MAP_METAL_HALF_BINOP(sub, -)
 ACPP_SSCP_MAP_METAL_HALF_BINOP(mul, *)
 ACPP_SSCP_MAP_METAL_HALF_BINOP(div, /)
+
+// ============================================================================
+// f64 (double-precision) soft-float stubs
+// ----------------------------------------------------------------------------
+// Apple GPUs do not implement IEEE 754 double precision in hardware. The MSL
+// SSCP emitter rewrites every `llvm.<op>.f64` intrinsic to a call to
+// `__acpp_sscp_<op>_f64` (see src/compiler/llvm-to-backend/metal/LLVMToMetal.cpp,
+// ReplaceIntrinsics::ReplaceIntrinsics). Those external symbols must resolve
+// at libkernel-bitcode link time, or the kernel silently fails to load with
+// "undefined symbol" errors on the MTLCompilerService side.
+//
+// Each stub below is declared so the linker is satisfied. Bodies call
+// __builtin_trap() because the vendored metal-float64 library at
+// ./float64/ has no actual soft-double arithmetic — upstream was abandoned
+// in 2023 after only shipping the `float64_t` skeleton class. See
+// ./float64/MAINTENANCE.md for the wire-up plan when an implementation
+// becomes available.
+//
+// Once a real soft-double implementation lives under ./float64/, swap
+// individual bodies from `__builtin_trap()` to the real call. The set of
+// declared symbols must not shrink — LLVMToMetal.cpp emits every one
+// unconditionally.
+//
+// TODO(acpp-soft-fp64): wire each body to metal-float64 impl once available.
+// ============================================================================
+
+#define ACPP_SSCP_F64_TRAP_STUB1(name) \
+  HIPSYCL_SSCP_BUILTIN double __acpp_sscp_##name##_f64(double) { \
+    __builtin_trap(); \
+  }
+
+#define ACPP_SSCP_F64_TRAP_STUB2(name) \
+  HIPSYCL_SSCP_BUILTIN double __acpp_sscp_##name##_f64(double, double) { \
+    __builtin_trap(); \
+  }
+
+#define ACPP_SSCP_F64_TRAP_STUB3(name) \
+  HIPSYCL_SSCP_BUILTIN double __acpp_sscp_##name##_f64(double, double, double) { \
+    __builtin_trap(); \
+  }
+
+// --- Unary double -> double --------------------------------------------------
+ACPP_SSCP_F64_TRAP_STUB1(acos)
+ACPP_SSCP_F64_TRAP_STUB1(acosh)
+ACPP_SSCP_F64_TRAP_STUB1(acospi)
+ACPP_SSCP_F64_TRAP_STUB1(asin)
+ACPP_SSCP_F64_TRAP_STUB1(asinh)
+ACPP_SSCP_F64_TRAP_STUB1(asinpi)
+ACPP_SSCP_F64_TRAP_STUB1(atan)
+ACPP_SSCP_F64_TRAP_STUB1(atanh)
+ACPP_SSCP_F64_TRAP_STUB1(atanpi)
+ACPP_SSCP_F64_TRAP_STUB1(cbrt)
+ACPP_SSCP_F64_TRAP_STUB1(ceil)
+ACPP_SSCP_F64_TRAP_STUB1(cos)
+ACPP_SSCP_F64_TRAP_STUB1(cosh)
+ACPP_SSCP_F64_TRAP_STUB1(cospi)
+ACPP_SSCP_F64_TRAP_STUB1(erf)
+ACPP_SSCP_F64_TRAP_STUB1(erfc)
+ACPP_SSCP_F64_TRAP_STUB1(exp)
+ACPP_SSCP_F64_TRAP_STUB1(exp2)
+ACPP_SSCP_F64_TRAP_STUB1(exp10)
+ACPP_SSCP_F64_TRAP_STUB1(expm1)
+ACPP_SSCP_F64_TRAP_STUB1(fabs)
+ACPP_SSCP_F64_TRAP_STUB1(floor)
+ACPP_SSCP_F64_TRAP_STUB1(lgamma)
+ACPP_SSCP_F64_TRAP_STUB1(log)
+ACPP_SSCP_F64_TRAP_STUB1(log2)
+ACPP_SSCP_F64_TRAP_STUB1(log10)
+ACPP_SSCP_F64_TRAP_STUB1(log1p)
+ACPP_SSCP_F64_TRAP_STUB1(logb)
+ACPP_SSCP_F64_TRAP_STUB1(rint)
+ACPP_SSCP_F64_TRAP_STUB1(round)
+ACPP_SSCP_F64_TRAP_STUB1(rsqrt)
+ACPP_SSCP_F64_TRAP_STUB1(sin)
+ACPP_SSCP_F64_TRAP_STUB1(sinh)
+ACPP_SSCP_F64_TRAP_STUB1(sinpi)
+ACPP_SSCP_F64_TRAP_STUB1(sqrt)
+ACPP_SSCP_F64_TRAP_STUB1(tan)
+ACPP_SSCP_F64_TRAP_STUB1(tanh)
+ACPP_SSCP_F64_TRAP_STUB1(tanpi)
+ACPP_SSCP_F64_TRAP_STUB1(tgamma)
+ACPP_SSCP_F64_TRAP_STUB1(trunc)
+
+// --- Binary (double, double) -> double --------------------------------------
+ACPP_SSCP_F64_TRAP_STUB2(atan2)
+ACPP_SSCP_F64_TRAP_STUB2(atan2pi)
+ACPP_SSCP_F64_TRAP_STUB2(copysign)
+ACPP_SSCP_F64_TRAP_STUB2(fdim)
+ACPP_SSCP_F64_TRAP_STUB2(fmax)
+ACPP_SSCP_F64_TRAP_STUB2(fmin)
+ACPP_SSCP_F64_TRAP_STUB2(fmod)
+ACPP_SSCP_F64_TRAP_STUB2(hypot)
+ACPP_SSCP_F64_TRAP_STUB2(maxmag)
+ACPP_SSCP_F64_TRAP_STUB2(minmag)
+ACPP_SSCP_F64_TRAP_STUB2(nextafter)
+ACPP_SSCP_F64_TRAP_STUB2(pow)
+ACPP_SSCP_F64_TRAP_STUB2(powr)
+ACPP_SSCP_F64_TRAP_STUB2(remainder)
+
+// --- Ternary (double, double, double) -> double -----------------------------
+ACPP_SSCP_F64_TRAP_STUB3(fma)
+ACPP_SSCP_F64_TRAP_STUB3(mad)
+
+// --- Mixed-type / non-uniform signatures ------------------------------------
+
+HIPSYCL_SSCP_BUILTIN double __acpp_sscp_fract_f64(double, double* /*iptr*/) {
+  __builtin_trap();
+}
+
+HIPSYCL_SSCP_BUILTIN double __acpp_sscp_frexp_f64(double, __acpp_int32* /*exp*/) {
+  __builtin_trap();
+}
+
+HIPSYCL_SSCP_BUILTIN __acpp_int32 __acpp_sscp_ilogb_f64(double) {
+  __builtin_trap();
+}
+
+HIPSYCL_SSCP_BUILTIN double __acpp_sscp_ldexp_f64(double, __acpp_int32 /*k*/) {
+  __builtin_trap();
+}
+
+HIPSYCL_SSCP_BUILTIN double __acpp_sscp_lgamma_r_f64(double, __acpp_int32* /*signp*/) {
+  __builtin_trap();
+}
+
+HIPSYCL_SSCP_BUILTIN double __acpp_sscp_modf_f64(double, double* /*iptr*/) {
+  __builtin_trap();
+}
+
+HIPSYCL_SSCP_BUILTIN double __acpp_sscp_pown_f64(double, __acpp_int32 /*n*/) {
+  __builtin_trap();
+}
+
+HIPSYCL_SSCP_BUILTIN double __acpp_sscp_rootn_f64(double, __acpp_int32 /*n*/) {
+  __builtin_trap();
+}
+
+// --- Classification / sign predicates (double -> int) -----------------------
+HIPSYCL_SSCP_BUILTIN __acpp_int32 __acpp_sscp_isnan_f64(double) {
+  __builtin_trap();
+}
+
+HIPSYCL_SSCP_BUILTIN __acpp_int32 __acpp_sscp_isinf_f64(double) {
+  __builtin_trap();
+}
+
+HIPSYCL_SSCP_BUILTIN __acpp_int32 __acpp_sscp_isfinite_f64(double) {
+  __builtin_trap();
+}
+
+HIPSYCL_SSCP_BUILTIN __acpp_int32 __acpp_sscp_isnormal_f64(double) {
+  __builtin_trap();
+}
+
+HIPSYCL_SSCP_BUILTIN __acpp_int32 __acpp_sscp_signbit_f64(double) {
+  __builtin_trap();
+}
