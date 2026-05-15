@@ -21,6 +21,7 @@
 #include <dlfcn.h>
 #include <filesystem>
 #include <fstream>
+#include <random>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -89,18 +90,70 @@ bool spawn_xcrun(const std::vector<std::string> &args) {
   return wait_for_child(pid, argv[0]);
 }
 
+// Build a process-private suffix combining pid + thread-local PRNG. Used to
+// derive temp filenames that cannot collide with sibling workers that share
+// the JIT cache directory and the same `<id>` hash. See
+// `compile_msl_to_metallib` for the race this prevents.
+std::string private_tmp_suffix() {
+  thread_local std::mt19937_64 gen{std::random_device{}()};
+  std::uniform_int_distribution<uint64_t> dist;
+  // pid + 64-bit random keeps the namespace per-process even when fork()
+  // duplicates the PRNG state into multiple children that then all reseed
+  // via std::random_device.
+  return std::to_string(static_cast<unsigned long long>(getpid())) + "." +
+         std::to_string(static_cast<unsigned long long>(dist(gen)));
+}
+
 // Pre-compile MSL to a `.metallib` file via `xcrun metal` + `xcrun metallib`.
 // Loading a `.metallib` via `device->newLibrary(url, ...)` does NOT route
 // through in-process source compilation in `MTLCompilerService`. Returns the
 // absolute path on success, empty string on failure.
+//
+// Race-fix history (pg_accel commit 490a1f4, 2026-05-15): the previous
+// implementation wrote/read/removed shared `<id>.metal` and `<id>.air`
+// intermediates. When multiple forked workers cold-started against the
+// same kernel hash, Worker A's post-compile `std::remove(metal_path)` /
+// `std::remove(air_path)` would unlink the files mid-flight under Worker
+// B's `xcrun metal` / `xcrun metallib`, manifesting as
+//   `LLVM ERROR: Error opening '<id>.air': No such file or directory!`
+// Worker B's `compile_msl_to_metallib` then returned `{}`, the caller
+// fell through to `build_metal_library_from_source`
+// (`metal_code_object.cpp:500`), and the in-process compile reached for
+// `MTLCompilerService` — dead in a forked child:
+//   `Unable to reach MTLCompilerService ... error 3 - No such process`
+// Cold-cache stress (`PGACCEL_FORK_STRESS_WORKERS=16
+// PGACCEL_FORK_STRESS_ITERS=10 ./test_fork_archive_stress`) reproduced
+// the XPC fallback at 12-75% per-worker.
+//
+// Fix: every intermediate (`.metal`, `.air`) AND the staged metallib
+// itself uses a process-private filename (`<id>.<pid>.<rand>.…`).
+// Sibling workers no longer touch each other's in-flight files. The
+// final `<id>.metallib` is produced by `std::filesystem::rename`, which
+// is atomic on POSIX same-filesystem renames — a concurrent
+// `device->newLibrary(url)` in another worker either sees the prior
+// complete file or the new complete file, never a half-written one.
+// On rename conflict (sibling raced to publish first) we accept the
+// existing file and discard our staged copy: both inputs are bit-for-
+// bit identical (same source hash → same `xcrun` output).
 std::string compile_msl_to_metallib(const std::string &source,
                                     const std::string &id_str) {
   using namespace common::filesystem;
   const std::string cache_dir = persistent_storage::get().get_jit_cache_dir();
-  const std::string metal_path = join_path(cache_dir, id_str + ".metal");
-  const std::string air_path = join_path(cache_dir, id_str + ".air");
   const std::string metallib_path = join_path(cache_dir, id_str + ".metallib");
 
+  // Process-private temp filenames keep concurrent workers from
+  // unlinking each other's in-flight inputs/outputs.
+  const std::string tmp_suffix = private_tmp_suffix();
+  const std::string metal_path =
+      join_path(cache_dir, id_str + "." + tmp_suffix + ".metal");
+  const std::string air_path =
+      join_path(cache_dir, id_str + "." + tmp_suffix + ".air");
+  const std::string staged_metallib_path =
+      join_path(cache_dir, id_str + "." + tmp_suffix + ".metallib.tmp");
+
+  // SAFETY: `atomic_write` itself uses a random tmp + rename, but the
+  // *target* `metal_path` is already process-private here, so the
+  // visible filename also never collides.
   if (!atomic_write(metal_path, source)) {
     HIPSYCL_DEBUG_WARNING
         << "metal_code_object: could not write MSL source to " << metal_path
@@ -113,16 +166,51 @@ std::string compile_msl_to_metallib(const std::string &source,
     HIPSYCL_DEBUG_WARNING
         << "metal_code_object: xcrun metal failed for " << metal_path
         << std::endl;
+    std::remove(metal_path.c_str());
     return {};
   }
 
-  if (!spawn_xcrun({"xcrun", "metallib", air_path, "-o", metallib_path})) {
+  if (!spawn_xcrun(
+          {"xcrun", "metallib", air_path, "-o", staged_metallib_path})) {
     HIPSYCL_DEBUG_WARNING
         << "metal_code_object: xcrun metallib failed for " << air_path
         << std::endl;
+    std::remove(metal_path.c_str());
+    std::remove(air_path.c_str());
     return {};
   }
 
+  // Publish the metallib atomically. std::filesystem::rename on POSIX is
+  // atomic on the same filesystem, so any concurrent
+  // `device->newLibrary(url)` sees either the pre-existing file or the
+  // freshly-renamed one — never a partial write.
+  std::error_code rename_ec;
+  std::filesystem::rename(staged_metallib_path, metallib_path, rename_ec);
+  if (rename_ec) {
+    // Two benign causes to swallow:
+    //   1. Another worker raced us to publish the same `<id>.metallib`
+    //      first. Same source hash → same bytes; accept theirs.
+    //   2. EXDEV across filesystems (extremely unlikely under
+    //      ~/.acpp/apps/global/jit-cache).
+    // Verify the canonical path exists before reporting success.
+    std::error_code exists_ec;
+    if (!std::filesystem::exists(metallib_path, exists_ec) || exists_ec) {
+      HIPSYCL_DEBUG_WARNING
+          << "metal_code_object: rename(" << staged_metallib_path << " -> "
+          << metallib_path << ") failed (" << rename_ec.message()
+          << ") and no pre-existing metallib found" << std::endl;
+      std::remove(metal_path.c_str());
+      std::remove(air_path.c_str());
+      std::remove(staged_metallib_path.c_str());
+      return {};
+    }
+    // Pre-existing metallib is fine; discard our staged copy.
+    std::remove(staged_metallib_path.c_str());
+  }
+
+  // Best-effort cleanup of our private intermediates. Removing files we
+  // own ourselves never races a sibling — the filenames are tagged with
+  // our pid + a per-thread PRNG draw.
   if (std::getenv("ACPP_METAL_KEEP_SOURCE") == nullptr) {
     std::remove(metal_path.c_str());
   }
