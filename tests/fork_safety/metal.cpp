@@ -8,6 +8,8 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
+#include <vector>
 #include <sycl/sycl.hpp>
 
 namespace {
@@ -29,6 +31,76 @@ int run_kernel(sycl::queue &q) {
       return 1;
     }
   }
+  return 0;
+}
+
+int run_shared_usm_event_wait_kernel() {
+  constexpr std::size_t N = 1024;
+  sycl::queue q;
+  const auto plat = q.get_device().get_platform().get_info<sycl::info::platform::name>();
+  if (plat.find("Metal") == std::string::npos && plat.find("metal") == std::string::npos) {
+    std::printf("metal fork-safety: no Metal device in cold child - skipping\n");
+    return 0;
+  }
+
+  int* data = sycl::malloc_shared<int>(N, q);
+  if (!data) {
+    std::fprintf(stderr, "metal fork-safety: shared USM allocation failed\n");
+    return 1;
+  }
+  for (std::size_t i = 0; i < N; ++i) {
+    data[i] = 0;
+  }
+
+  try {
+    auto evt = q.submit([&](sycl::handler& cgh) {
+      cgh.parallel_for(sycl::range<1>{N}, [=](sycl::id<1> i) {
+        data[i] = static_cast<int>(i[0] + 7);
+      });
+    });
+    evt.wait_and_throw();
+  } catch (const sycl::exception& e) {
+    std::fprintf(stderr, "metal fork-safety: cold child event wait threw: %s\n", e.what());
+    sycl::free(data, q);
+    return 1;
+  }
+
+  for (std::size_t i = 0; i < N; ++i) {
+    if (data[i] != static_cast<int>(i + 7)) {
+      std::fprintf(stderr, "metal fork-safety: cold child bad USM result at %zu: %d\n", i, data[i]);
+      sycl::free(data, q);
+      return 1;
+    }
+  }
+  sycl::free(data, q);
+  return 0;
+}
+
+int cold_fork_child_initializes_metal() {
+  pid_t pid = fork();
+  if (pid < 0) {
+    std::perror("fork");
+    return 1;
+  }
+  if (pid == 0) {
+    // Child: Metal has not been initialized in the parent. This is the
+    // postmaster-style fork shape used by PostgreSQL backend workers.
+    _exit(run_shared_usm_event_wait_kernel());
+  }
+
+  int status = 0;
+  if (waitpid(pid, &status, 0) < 0) {
+    std::perror("waitpid");
+    return 1;
+  }
+  const int child_exit = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+  if (child_exit != 0) {
+    std::fprintf(stderr,
+                 "metal fork-safety: cold child failed shared-USM event wait (status=%d)\n",
+                 status);
+    return 1;
+  }
+  std::printf("metal fork-safety: cold child initialized Metal and waited on event\n");
   return 0;
 }
 
@@ -62,6 +134,10 @@ int submit_expecting_error() {
 } // namespace
 
 int main() {
+  if (cold_fork_child_initializes_metal() != 0) {
+    return 1;
+  }
+
   sycl::queue q;
   const auto plat = q.get_device().get_platform().get_info<sycl::info::platform::name>();
   if (plat.find("Metal") == std::string::npos && plat.find("metal") == std::string::npos) {

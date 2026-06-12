@@ -34,11 +34,11 @@ namespace hipsycl {
 namespace compiler {
 
 struct MetalEmitterOptions {
-  // Metal supports at most 31 [[buffer(N)]] arguments in flat mode.
-  // When a kernel has more than maxArgsForFlatMode parameters, all arguments
-  // are packed into a single argument buffer struct instead.
+  // Metal supports at most 31 [[buffer(N)]] arguments in flat mode. The runtime
+  // reserves two buffers, so 29 user arguments fit before falling back to an
+  // argument buffer struct.
   // Controlled at runtime via kernel_build_option::metal_max_args_for_flat_mode.
-  int maxArgsForFlatMode = 6;
+  int maxArgsForFlatMode = 29;
   std::unordered_map<unsigned, std::string> addressSpaceMap = {
     {0, "device"},
     {1, "device"},

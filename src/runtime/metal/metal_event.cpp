@@ -12,6 +12,7 @@
 
 #include <Metal/Metal.hpp>
 
+#include <chrono>
 #include <thread>
 
 namespace hipsycl {
@@ -31,8 +32,18 @@ bool metal_node_event::is_complete() const {
 }
 
 void metal_node_event::wait() {
-  while (!_handle.event->waitUntilSignaledValue(_handle.value, 1000)) {
-    std::this_thread::yield();
+  // Avoid MTLSharedEvent::waitUntilSignaledValue() in forked backend
+  // processes. On macOS/Metal this blocking API can enter Apple logging /
+  // CoreAnalytics paths that abort on the child side of fork-before-exec.
+  // Polling signaledValue() keeps the wait in simple user-space code; the
+  // command buffer itself still signals the shared event on the GPU.
+  unsigned num_spins = 0;
+  while (!is_complete()) {
+    if (num_spins++ < 64) {
+      std::this_thread::yield();
+    } else {
+      std::this_thread::sleep_for(std::chrono::microseconds{50});
+    }
   }
 }
 

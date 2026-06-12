@@ -27,12 +27,15 @@ namespace rt {
 
 namespace {
 
-// Metal supports at most 31 [[buffer(N)]] arguments in flat mode.
-// When a kernel has more than metal_max_args_for_flat_mode parameters,
-// all arguments are packed into a single argument buffer struct instead.
-// This value is passed to the compiler via kernel_build_option::metal_max_args_for_flat_mode,
-// which sets MetalEmitterOptions::maxArgsForFlatMode in LLVMToMetal.
-static constexpr int metal_max_args_for_flat_mode = 6;
+// Metal supports at most 31 [[buffer(N)]] arguments in flat mode. AdaptiveCpp
+// reserves buffer(0) for dynamic local memory size and buffer(1) for the
+// host/device address delta, so 29 user kernel arguments fit without argument
+// buffers. Prefer flat bindings whenever possible: the argument-buffer encoder
+// creation path has proven fragile under concurrent cold Metal backends.
+static constexpr int metal_reserved_buffer_args = 2;
+static constexpr int metal_max_buffer_args = 31;
+static constexpr int metal_max_args_for_flat_mode =
+    metal_max_buffer_args - metal_reserved_buffer_args;
 
 inline unsigned align_up(unsigned x, unsigned a) {
   return (x + (a - 1)) & ~(a - 1);
