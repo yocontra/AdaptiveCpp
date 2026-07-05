@@ -663,6 +663,10 @@ endif()
 
 message(STATUS "Default compilation target(s): ${DEFAULT_TARGETS}")
 
+set(ACPP_DEFAULT_TARGETS_JSON "${DEFAULT_TARGETS}")
+string(REPLACE "\\" "\\\\" ACPP_DEFAULT_TARGETS_JSON "${ACPP_DEFAULT_TARGETS_JSON}")
+string(REPLACE "\"" "\\\"" ACPP_DEFAULT_TARGETS_JSON "${ACPP_DEFAULT_TARGETS_JSON}")
+string(REPLACE ";" "\\;" ACPP_DEFAULT_TARGETS_JSON "${ACPP_DEFAULT_TARGETS_JSON}")
 
 set(ACPP_CORE_CONFIG_FILE "{
   \"version-major\" : \"${ACPP_VERSION_MAJOR}\",
@@ -674,7 +678,7 @@ set(ACPP_CORE_CONFIG_FILE "{
   \"plugin-with-cpu-acceleration\" : \"${WITH_ACCELERATED_CPU}\",
   \"plugin-with-sscp-compiler\" : \"${WITH_SSCP_COMPILER}\",
   \"default-clang\"     : \"${CLANG_INSTALLED_PATH}\",
-  \"default-targets\"  : \"${DEFAULT_TARGETS}\",
+  \"default-targets\"  : \"${ACPP_DEFAULT_TARGETS_JSON}\",
   \"default-cpu-cxx\"   : \"${CMAKE_CXX_COMPILER}\",
   \"default-rocm-path\" : \"${ROCM_PATH}\",
   \"default-use-bootstrap-mode\" : \"false\",
@@ -1037,4 +1041,3 @@ install(EXPORT install_exports
 mark_as_advanced(
   ADAPTIVECPP_INSTALL_CMAKE_DIR
 )
-
