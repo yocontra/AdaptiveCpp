@@ -1071,32 +1071,116 @@ bool LLVMToMetalTranslator::translateToBackendFormat(llvm::Module& FlavoredModul
   {
     llvm::SmallPtrSet<llvm::Function*, 32> reachable;
     llvm::SmallVector<llvm::Function*, 16> worklist;
-    // Roots:
-    //   1. The kernel functions themselves.
-    //   2. Every `__acpp_sscp_soft_f64_*` primitive (add/sub/mul/div/rem/
-    //      neg/fcmp/fmin_precise/fmax_precise/from_*/to_*). These are
-    //      EMITTER-IMPLICIT - MetalEmitter emits calls to them as TEXT
-    //      directly from `fadd double`, `fcmp double`, fp64 cast/conv IR
-    //      instructions in the kernel body; the IR itself has no `call`
-    //      to them, so a pure CallBase walk wouldn't find them. Seed them
-    //      unconditionally; their bodies (`sf64_add` etc.) come along
-    //      transitively. Math forwarders like `__acpp_sscp_sin_f64` are
-    //      NOT in this set - they're invoked from the IR via direct
-    //      calls (after ReplaceIntrinsics), so the BFS picks them up
-    //      only when the kernel actually uses them.
+
+    auto isScalarOrVectorDouble = [](llvm::Type* T) {
+      if (T->isDoubleTy()) return true;
+      if (auto* VT = llvm::dyn_cast<llvm::FixedVectorType>(T))
+        return VT->getElementType()->isDoubleTy();
+      return false;
+    };
+    auto addReachable = [&](llvm::Function* F) {
+      if (F && !F->isDeclaration() && reachable.insert(F).second)
+        worklist.push_back(F);
+    };
+    auto addReachableByName = [&](llvm::StringRef Name) {
+      addReachable(FlavoredModule.getFunction(Name));
+    };
+    auto addImplicitSoftF64Callees = [&](llvm::Instruction& I) {
+      // MetalEmitter lowers these fp64 opcodes to source-level helper calls
+      // without an IR CallBase. Keep exactly the helpers the live call graph
+      // needs; unconditional primitive seeding bloats single-kernel MSL and
+      // can crash Apple's pipeline compiler on transcendental kernels.
+      if (auto* BO = llvm::dyn_cast<llvm::BinaryOperator>(&I)) {
+        if (isScalarOrVectorDouble(BO->getType())) {
+          switch (BO->getOpcode()) {
+            case llvm::Instruction::FAdd:
+              addReachableByName("__acpp_sscp_soft_f64_add");
+              break;
+            case llvm::Instruction::FSub:
+              addReachableByName("__acpp_sscp_soft_f64_sub");
+              break;
+            case llvm::Instruction::FMul:
+              addReachableByName("__acpp_sscp_soft_f64_mul");
+              break;
+            case llvm::Instruction::FDiv:
+              addReachableByName("__acpp_sscp_soft_f64_div");
+              break;
+            case llvm::Instruction::FRem:
+              addReachableByName("__acpp_sscp_soft_f64_rem");
+              break;
+            default:
+              break;
+          }
+        }
+      } else if (auto* FC = llvm::dyn_cast<llvm::FCmpInst>(&I)) {
+        if (isScalarOrVectorDouble(FC->getOperand(0)->getType())) {
+          const llvm::Function* Parent = FC->getFunction();
+          unsigned pred = static_cast<unsigned>(FC->getPredicate());
+          bool inFcmpBody =
+              Parent && (Parent->getName() == "sf64_fcmp" ||
+                         Parent->getName() == "__acpp_sscp_soft_f64_fcmp");
+          bool emittedInlineInFcmpBody =
+              inFcmpBody && (pred == llvm::FCmpInst::FCMP_OEQ ||
+                             pred == llvm::FCmpInst::FCMP_ORD ||
+                             pred == llvm::FCmpInst::FCMP_UNO ||
+                             pred == llvm::FCmpInst::FCMP_UNE);
+          if (!emittedInlineInFcmpBody)
+            addReachableByName("__acpp_sscp_soft_f64_fcmp");
+        }
+      } else if (auto* CI = llvm::dyn_cast<llvm::CastInst>(&I)) {
+        llvm::Type* DT = CI->getDestTy();
+        llvm::Type* ST = CI->getSrcTy();
+        if (DT->isDoubleTy() || ST->isDoubleTy()) {
+          auto intBits = [](llvm::Type* T) -> unsigned {
+            return T->isIntegerTy() ? T->getIntegerBitWidth() : 0u;
+          };
+          switch (CI->getOpcode()) {
+            case llvm::Instruction::FPExt:
+              addReachableByName("__acpp_sscp_soft_f64_from_f32");
+              break;
+            case llvm::Instruction::FPTrunc:
+              addReachableByName("__acpp_sscp_soft_f64_to_f32");
+              break;
+            case llvm::Instruction::FPToSI:
+              addReachableByName(intBits(DT) == 64
+                                     ? "__acpp_sscp_soft_f64_to_i64"
+                                     : "__acpp_sscp_soft_f64_to_i32");
+              break;
+            case llvm::Instruction::FPToUI:
+              addReachableByName(intBits(DT) == 64
+                                     ? "__acpp_sscp_soft_f64_to_u64"
+                                     : "__acpp_sscp_soft_f64_to_u32");
+              break;
+            case llvm::Instruction::SIToFP:
+              addReachableByName(intBits(ST) == 64
+                                     ? "__acpp_sscp_soft_f64_from_i64"
+                                     : "__acpp_sscp_soft_f64_from_i32");
+              break;
+            case llvm::Instruction::UIToFP:
+              addReachableByName(intBits(ST) == 64
+                                     ? "__acpp_sscp_soft_f64_from_u64"
+                                     : "__acpp_sscp_soft_f64_from_u32");
+              break;
+            default:
+              break;
+          }
+        }
+      }
+    };
+
+    // Seed only the kernels. Math forwarders like `__acpp_sscp_sin_f64`
+    // are direct calls after ReplaceIntrinsics and will be discovered by
+    // BFS; emitter-implicit primitives are added from live opcodes above.
     for (llvm::Function& F : FlavoredModule) {
       if (F.isDeclaration()) continue;
-      llvm::StringRef Name = F.getName();
-      bool isKernel = kernelNames.count(Name.str()) > 0;
-      bool isImplicitPrimitive = Name.starts_with("__acpp_sscp_soft_f64_");
-      if (isKernel || isImplicitPrimitive) {
-        if (reachable.insert(&F).second) worklist.push_back(&F);
-      }
+      if (kernelNames.count(F.getName().str()) > 0)
+        addReachable(&F);
     }
     while (!worklist.empty()) {
       llvm::Function* F = worklist.pop_back_val();
       for (llvm::BasicBlock& BB : *F) {
         for (llvm::Instruction& I : BB) {
+          addImplicitSoftF64Callees(I);
           if (auto* CB = llvm::dyn_cast<llvm::CallBase>(&I)) {
             llvm::Function* Callee = CB->getCalledFunction();
             if (Callee && !Callee->isDeclaration() &&
@@ -1107,8 +1191,14 @@ bool LLVMToMetalTranslator::translateToBackendFormat(llvm::Module& FlavoredModul
         }
       }
     }
-    // Drop unreachable soft-fp64 surface functions only - leave other
-    // AdaptiveCpp libkernel functions alone.
+    // Drop unreachable helper functions as a closure. The public
+    // `sf64_*`/`__acpp_sscp_*_f64` symbols are only the entry points; the
+    // external library also contributes C++ helpers under `soft_fp64` and
+    // anonymous-namespace local helpers. Keeping an unreachable helper while
+    // deleting one of its unreachable callees leaves calls to `undef`, and
+    // MetalEmitter still tries to emit that helper. Delete unreachable
+    // discardable helpers too; this JIT module only needs the kernel roots
+    // and their transitive callees.
     llvm::SmallVector<llvm::Function*, 64> drop;
     for (llvm::Function& F : FlavoredModule) {
       if (F.isDeclaration()) continue;
@@ -1118,7 +1208,10 @@ bool LLVMToMetalTranslator::translateToBackendFormat(llvm::Module& FlavoredModul
           Name.starts_with("__acpp_sscp_soft_f64_") ||
           (Name.starts_with("__acpp_sscp_") &&
            (Name.ends_with("_f64") || Name.ends_with("_f64_precise")));
-      if (isSoftF64Surface && !reachable.contains(&F)) {
+      bool isSoftF64Helper = Name.starts_with("_ZN9soft_fp64");
+      bool isDiscardableHelper = F.hasLocalLinkage() || F.isDiscardableIfUnused();
+      if ((isSoftF64Surface || isSoftF64Helper || isDiscardableHelper) &&
+          !reachable.contains(&F)) {
         drop.push_back(&F);
       }
     }
@@ -1160,6 +1253,35 @@ bool LLVMToMetalTranslator::translateToBackendFormat(llvm::Module& FlavoredModul
       HIPSYCL_DEBUG_INFO
           << "LLVMToMetal: reachability prune dropped " << drop.size()
           << " unreachable soft-fp64 surface functions\n";
+    }
+
+    bool droppedGlobals = true;
+    unsigned numDroppedGlobals = 0;
+    while (droppedGlobals) {
+      droppedGlobals = false;
+      llvm::SmallVector<llvm::GlobalVariable*, 32> globalDrop;
+      for (llvm::GlobalVariable& GV : FlavoredModule.globals()) {
+        if (GV.getName() == "llvm.compiler.used") continue;
+        if (GV.isDeclaration()) continue;
+        GV.removeDeadConstantUsers();
+        bool isDiscardableGlobal =
+            GV.hasLocalLinkage() || GV.isDiscardableIfUnused();
+        if (isDiscardableGlobal && GV.use_empty()) {
+          globalDrop.push_back(&GV);
+        }
+      }
+      for (llvm::GlobalVariable* GV : globalDrop) {
+        GV->eraseFromParent();
+      }
+      if (!globalDrop.empty()) {
+        droppedGlobals = true;
+        numDroppedGlobals += globalDrop.size();
+      }
+    }
+    if (numDroppedGlobals != 0) {
+      HIPSYCL_DEBUG_INFO
+          << "LLVMToMetal: reachability prune dropped "
+          << numDroppedGlobals << " unreachable globals\n";
     }
   }
 

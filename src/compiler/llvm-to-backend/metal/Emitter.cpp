@@ -10,6 +10,7 @@
 // SPDX-License-Identifier: BSD-2-Clause
 #include <llvm/IR/Dominators.h>
 #include <llvm/IR/ModuleSlotTracker.h>
+#include <llvm/ADT/SmallPtrSet.h>
 #include <llvm/Analysis/LoopInfo.h>
 #include <llvm/Analysis/PostDominators.h>
 
@@ -48,6 +49,8 @@
 #include "Emitter.hpp"
 #include "HLTree.hpp"
 #include "HLExtractionPass.hpp"
+
+#include <algorithm>
 
 using namespace llvm;
 
@@ -120,6 +123,63 @@ std::optional<std::string> extractStringConstant(llvm::Value* V, std::string& er
     result.pop_back();
   }
   return result;
+}
+
+bool isMetalInlineSelectorCallee(const llvm::Function* F) {
+  return F && F->getName().starts_with("__acpp_sscp_metal");
+}
+
+bool onlyUsedAsMetalInlineSelector(
+    const llvm::Value* V, llvm::SmallPtrSetImpl<const llvm::Value*>& visited) {
+  if (!visited.insert(V).second) {
+    return true;
+  }
+
+  bool sawUse = false;
+  for (const llvm::User* U : V->users()) {
+    sawUse = true;
+
+    if (auto* CE = llvm::dyn_cast<llvm::ConstantExpr>(U)) {
+      auto op = CE->getOpcode();
+      if (op == llvm::Instruction::GetElementPtr ||
+          op == llvm::Instruction::AddrSpaceCast ||
+          op == llvm::Instruction::BitCast) {
+        if (!onlyUsedAsMetalInlineSelector(CE, visited)) {
+          return false;
+        }
+        continue;
+      }
+      return false;
+    }
+
+    if (auto* CB = llvm::dyn_cast<llvm::CallBase>(U)) {
+      if (!isMetalInlineSelectorCallee(CB->getCalledFunction())) {
+        return false;
+      }
+      if (CB->arg_empty() || CB->getArgOperand(0) != V) {
+        return false;
+      }
+      continue;
+    }
+
+    return false;
+  }
+
+  return sawUse;
+}
+
+bool isMetalInlineSelectorGlobal(const llvm::GlobalVariable& GV) {
+  if (!GV.hasInitializer()) {
+    return false;
+  }
+
+  auto* CDA = llvm::dyn_cast<llvm::ConstantDataArray>(GV.getInitializer());
+  if (!CDA || !CDA->isString()) {
+    return false;
+  }
+
+  llvm::SmallPtrSet<const llvm::Value*, 8> visited;
+  return onlyUsedAsMetalInlineSelector(&GV, visited);
 }
 
 std::string f32IsNanExpr(const std::string& x) {
@@ -312,6 +372,7 @@ constant long& constant __acpp_sscp_metal_gpu_to_host_addr_diff [[buffer(1)]];
 
   auto callGraph = buildCallGraph();
   auto sortedFunctions = topologicalSort(callGraph);
+  analyzeFunctionAddressSpaceSpecializations(sortedFunctions);
 
   // Emit forward declarations for every non-kernel function before any
   // bodies. InstCombine (during the libkernel bitcode build at -O3) can
@@ -321,16 +382,31 @@ constant long& constant __acpp_sscp_metal_gpu_to_host_addr_diff [[buffer(1)]];
   // `__acpp_sscp_copysign_f64` calling `sf64_copysign`. Topological sort
   // can't pick an order that satisfies such cycles, so MSL refuses to
   // compile on "use before declaration". Forward decls break the cycle.
+  auto emitForwardDeclaration =
+      [&](Function& F, const AddressSpaceSignature* addressSpaces) {
+        if (F.hasFnAttribute(Attribute::NoInline)) {
+          os << "__attribute__((noinline)) ";
+        }
+        os << mapType(F.getReturnType()) << " "
+           << specializedFunctionName(F, addressSpaces) << " (";
+        bool first = true;
+        for (Argument& A : F.args()) {
+          if (!first) os << ", ";
+          first = false;
+          os << mapArgumentType(A, addressSpaces) << " " << valueName(&A);
+        }
+        os << ");\n";
+      };
+
   for (Function* F : sortedFunctions) {
     if (kernelNames.count(F->getName().str()) > 0) continue;
-    os << mapType(F->getReturnType()) << " " << F->getName().str() << " (";
-    bool first = true;
-    for (Argument& A : F->args()) {
-      if (!first) os << ", ";
-      first = false;
-      os << mapType(A.getType()) << " " << valueName(&A);
+    emitForwardDeclaration(*F, nullptr);
+    auto specializations = functionAddressSpaceSpecializations.find(F);
+    if (specializations != functionAddressSpaceSpecializations.end()) {
+      for (const auto& signature : specializations->second) {
+        emitForwardDeclaration(*F, &signature);
+      }
     }
-    os << ");\n";
   }
   os << "\n";
 
@@ -345,6 +421,17 @@ constant long& constant __acpp_sscp_metal_gpu_to_host_addr_diff [[buffer(1)]];
     if (!emitFunction(*F, *hlPass.tree)) {
       return false;
     }
+
+    if (kernelNames.count(F->getName().str()) == 0) {
+      auto specializations = functionAddressSpaceSpecializations.find(F);
+      if (specializations != functionAddressSpaceSpecializations.end()) {
+        for (const auto& signature : specializations->second) {
+          if (!emitFunction(*F, *hlPass.tree, &signature)) {
+            return false;
+          }
+        }
+      }
+    }
   }
 
   if (errorMsg.has_value()) {
@@ -355,13 +442,20 @@ constant long& constant __acpp_sscp_metal_gpu_to_host_addr_diff [[buffer(1)]];
   return true;
 }
 
-bool MetalEmitter::emitFunction(Function& F, const Node& node) {
+bool MetalEmitter::emitFunction(Function& F, const Node& node,
+                                const AddressSpaceSignature* addressSpaces) {
+  const AddressSpaceSignature* previousAddressSpaces = currentFunctionAddressSpaces;
+  currentFunctionAddressSpaces = addressSpaces;
+  inferredPtrAS.clear();
   collectVariablesInfo(F);
 
   bool success = emitArgStruct(F) &&
-    emitSignature(F) &&
+    emitSignature(F, addressSpaces) &&
     emitDeclarations() &&
     emitNode(node, 1);
+
+  currentFunctionAddressSpaces = previousAddressSpaces;
+  inferredPtrAS.clear();
 
   if (!success) {
     return false;
@@ -418,6 +512,7 @@ void MetalEmitter::emitGlobalConstants() {
     // definition itself. Both represent module-scope readonly data and
     // lower to MSL's `constant` address space identically.
     if (GV.getAddressSpace() != 4 && GV.getAddressSpace() != 1) continue;
+    if (isMetalInlineSelectorGlobal(GV)) continue;
 
     std::string name = valueName(&GV);
     std::string init = emitConstantInitializer(GV.getInitializer());
@@ -857,7 +952,8 @@ bool MetalEmitter::emitArgStruct(Function& F) {
   return true;
 }
 
-bool MetalEmitter::emitSignature(Function& F) {
+bool MetalEmitter::emitSignature(Function& F,
+                                 const AddressSpaceSignature* addressSpaces) {
   bool isKernel = kernelNames.count(F.getName().str()) > 0;
 
   bool useArgStruct = isKernel && F.arg_size() > opt.maxArgsForFlatMode;
@@ -866,7 +962,10 @@ bool MetalEmitter::emitSignature(Function& F) {
   }
 
   std::string returnType = isKernel ? "void" : mapType(F.getReturnType());
-  os << returnType << " " << F.getName().str() << " (";
+  if (!isKernel && F.hasFnAttribute(Attribute::NoInline)) {
+    os << "__attribute__((noinline)) ";
+  }
+  os << returnType << " " << specializedFunctionName(F, addressSpaces) << " (";
 
   bool first = true;
   int bufIdx = 2; // index=0 is reserved for dynamic local memory size, index=1 for host-to-device address difference, so start from 2
@@ -877,7 +976,7 @@ bool MetalEmitter::emitSignature(Function& F) {
     for (Argument &A : F.args()) {
       if (!first) os << ", ";
       first = false;
-      auto typeName = mapType(A.getType());
+      auto typeName = mapArgumentType(A, addressSpaces);
 
       if (isKernel) {
         if (!A.getType()->isPointerTy()) {
@@ -2072,6 +2171,11 @@ bool MetalEmitter::emitCallInstruction(const CallInst* CI, const std::string& na
   }
 
   int argsSize = CI->arg_size();
+  if (!callee->isDeclaration() && kernelNames.count(calleeName) == 0) {
+    auto signature = getCallAddressSpaceSignature(CI);
+    calleeName = specializedFunctionName(*callee, &signature);
+  }
+
   if (callee->isDeclaration()) {
     auto returnType = callee->getReturnType();
     if (returnType->isStructTy()) {
@@ -2423,6 +2527,22 @@ std::string MetalEmitter::mapType(const llvm::Value* V) {
   }
 }
 
+std::string MetalEmitter::mapArgumentType(const llvm::Argument& A,
+                                          const AddressSpaceSignature* addressSpaces) {
+  if (!A.getType()->isPointerTy()) {
+    return mapType(A.getType());
+  }
+
+  if (addressSpaces && A.getArgNo() < addressSpaces->size()) {
+    unsigned AS = (*addressSpaces)[A.getArgNo()];
+    if (AS != NonPointerAddressSpace) {
+      return getAddressSpaceKeyword(AS) + " void*";
+    }
+  }
+
+  return mapType(A.getType());
+}
+
 std::string MetalEmitter::getAddressSpaceKeyword(unsigned AS) {
   auto it = addressSpaceMap.find(AS);
   if (it != addressSpaceMap.end()) {
@@ -2431,6 +2551,96 @@ std::string MetalEmitter::getAddressSpaceKeyword(unsigned AS) {
     errorMsg = "Error: Unknown address space " + std::to_string(AS) + "\n";
     return "";
   }
+}
+
+MetalEmitter::AddressSpaceSignature
+MetalEmitter::getDefaultAddressSpaceSignature(const Function& F) const {
+  AddressSpaceSignature signature;
+  signature.reserve(F.arg_size());
+  for (const Argument& A : F.args()) {
+    if (A.getType()->isPointerTy()) {
+      signature.push_back(A.getType()->getPointerAddressSpace());
+    } else {
+      signature.push_back(NonPointerAddressSpace);
+    }
+  }
+  return signature;
+}
+
+MetalEmitter::AddressSpaceSignature
+MetalEmitter::getCallAddressSpaceSignature(const CallInst* CI) {
+  AddressSpaceSignature signature;
+  Function* callee = CI->getCalledFunction();
+  signature.reserve(callee ? callee->arg_size() : CI->arg_size());
+
+  for (unsigned i = 0; i < CI->arg_size(); ++i) {
+    Value* arg = CI->getArgOperand(i);
+    if (!arg->getType()->isPointerTy()) {
+      signature.push_back(NonPointerAddressSpace);
+      continue;
+    }
+
+    unsigned AS = getPhysicalPointerAddressSpace(arg);
+    if (AS == 0 && isa<Constant>(arg) &&
+        !isa<ConstantPointerNull>(arg) && !isa<UndefValue>(arg) &&
+        !isa<PoisonValue>(arg)) {
+      AS = 4;
+    }
+    if (AS == 0 && callee && i < callee->arg_size()) {
+      AS = callee->getArg(i)->getType()->getPointerAddressSpace();
+    }
+    signature.push_back(AS);
+  }
+
+  return signature;
+}
+
+bool MetalEmitter::needsAddressSpaceSpecialization(
+    const Function& F, const AddressSpaceSignature& signature) const {
+  auto defaultSignature = getDefaultAddressSpaceSignature(F);
+  size_t count = std::min(defaultSignature.size(), signature.size());
+  for (size_t i = 0; i < count; ++i) {
+    if (signature[i] == NonPointerAddressSpace ||
+        defaultSignature[i] == NonPointerAddressSpace) {
+      continue;
+    }
+    if (signature[i] != defaultSignature[i]) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool MetalEmitter::addFunctionAddressSpaceSpecialization(
+    const Function& F, const AddressSpaceSignature& signature) {
+  if (!needsAddressSpaceSpecialization(F, signature)) {
+    return false;
+  }
+
+  auto& signatures = functionAddressSpaceSpecializations[&F];
+  if (std::find(signatures.begin(), signatures.end(), signature) != signatures.end()) {
+    return false;
+  }
+  signatures.push_back(signature);
+  return true;
+}
+
+std::string MetalEmitter::specializedFunctionName(
+    const Function& F, const AddressSpaceSignature* addressSpaces) const {
+  std::string name = F.getName().str();
+  if (!addressSpaces || !needsAddressSpaceSpecialization(F, *addressSpaces)) {
+    return name;
+  }
+
+  name += "__acpp_as";
+  unsigned argIndex = 0;
+  for (unsigned AS : *addressSpaces) {
+    if (AS != NonPointerAddressSpace) {
+      name += "_p" + std::to_string(argIndex) + "_" + std::to_string(AS);
+    }
+    ++argIndex;
+  }
+  return name;
 }
 
 const Value* MetalEmitter::stripToRootObject(const Value* V) {
@@ -2473,6 +2683,22 @@ unsigned MetalEmitter::getPhysicalPointerAddressSpace(const Value* V) {
   unsigned AS = T->getPointerAddressSpace();
   if (AS != 0) {
     return AS;
+  }
+  if (isa<ConstantPointerNull>(V) || isa<UndefValue>(V) ||
+      isa<PoisonValue>(V)) {
+    return 0;
+  }
+  if (isa<Constant>(V)) {
+    return 4;
+  }
+  if (auto* Arg = dyn_cast<Argument>(V)) {
+    if (currentFunctionAddressSpaces &&
+        Arg->getArgNo() < currentFunctionAddressSpaces->size()) {
+      unsigned specializedAS = (*currentFunctionAddressSpaces)[Arg->getArgNo()];
+      if (specializedAS != NonPointerAddressSpace && specializedAS != 0) {
+        return specializedAS;
+      }
+    }
   }
   auto it = inferredPtrAS.find(V);
   if (it != inferredPtrAS.end()) {
@@ -2574,6 +2800,53 @@ void MetalEmitter::analyzeCallInsts() {
       }
     }
   }
+}
+
+void MetalEmitter::analyzeFunctionAddressSpaceSpecializations(
+    const std::vector<Function*>& sortedFunctions) {
+  functionAddressSpaceSpecializations.clear();
+
+  const AddressSpaceSignature* previousAddressSpaces = currentFunctionAddressSpaces;
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (Function* F : sortedFunctions) {
+      std::vector<AddressSpaceSignature> callerSignatures;
+      callerSignatures.push_back(getDefaultAddressSpaceSignature(*F));
+      auto existing = functionAddressSpaceSpecializations.find(F);
+      if (existing != functionAddressSpaceSpecializations.end()) {
+        callerSignatures.insert(callerSignatures.end(),
+                                existing->second.begin(),
+                                existing->second.end());
+      }
+
+      for (const auto& callerSignature : callerSignatures) {
+        currentFunctionAddressSpaces = &callerSignature;
+        inferredPtrAS.clear();
+
+        for (BasicBlock& BB : *F) {
+          for (Instruction& I : BB) {
+            auto* CI = dyn_cast<CallInst>(&I);
+            if (!CI) {
+              continue;
+            }
+
+            Function* Callee = CI->getCalledFunction();
+            if (!Callee || Callee->isDeclaration() ||
+                kernelNames.count(Callee->getName().str()) > 0) {
+              continue;
+            }
+
+            auto calleeSignature = getCallAddressSpaceSignature(CI);
+            changed |= addFunctionAddressSpaceSpecialization(*Callee, calleeSignature);
+          }
+        }
+      }
+    }
+  }
+
+  currentFunctionAddressSpaces = previousAddressSpaces;
+  inferredPtrAS.clear();
 }
 
 // Scan the module for i64 storage that backs an atomic op (LLVM atomic

@@ -129,9 +129,13 @@ if(WITH_LLVM_TO_METAL)
   # unresolvable. Mode 0 ("disabled") compiles SF64_FE_RAISE to a no-op
   # and removes the thread_local variable. Host-side fenv observability
   # is unaffected (it's surfaced from outside the kernel anyway).
+  # `SF64_DISABLE_SLEEF_INLINE` keeps SLEEF polynomial/DD helpers outlined
+  # so the Metal source emitter can compile them as specialized helper
+  # functions instead of dumping massive fp64 bodies into each kernel.
   list(APPEND METAL_LIBKERNEL_EXTRA_ARGS
        -DSOFT_FP64_FENV_MODE=0
-       -DSOFT_FP64_SNAN_PROPAGATE=0)
+       -DSOFT_FP64_SNAN_PROPAGATE=0
+       -DSF64_DISABLE_SLEEF_INLINE)
 
   # Build soft-fp64's OpenCL compatibility surface as well. The strict
   # `sf64_*` ABI remains subnormal-preserving; FTZ is disabled for Metal so

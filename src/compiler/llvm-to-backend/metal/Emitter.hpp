@@ -11,10 +11,12 @@
 #ifndef EMITTER_HPP
 #define EMITTER_HPP
 
-#include <string>
-#include <unordered_set>
-#include <sstream>
 #include <map>
+#include <string>
+#include <sstream>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #include "HLTree.hpp"
 
@@ -24,6 +26,8 @@ namespace llvm {
 class Module;
 class ModuleSlotTracker;
 class Function;
+class Argument;
+class CallInst;
 class Value;
 class Constant;
 class BasicBlock;
@@ -58,14 +62,19 @@ public:
   }
 
 private:
-  bool emitFunction(llvm::Function& F, const hl::Node& node);
+  static constexpr unsigned NonPointerAddressSpace = ~0u;
+  using AddressSpaceSignature = std::vector<unsigned>;
+
+  bool emitFunction(llvm::Function& F, const hl::Node& node,
+                    const AddressSpaceSignature* addressSpaces = nullptr);
   void emitEarlyFp64Helpers();
   void emitTypes();
   void emitIntrinsicHelpers();
   void emitGlobalConstants();
   std::string emitConstantInitializer(const llvm::Constant* C);
   bool emitArgStruct(llvm::Function& F);
-  bool emitSignature(llvm::Function& F);
+  bool emitSignature(llvm::Function& F,
+                     const AddressSpaceSignature* addressSpaces = nullptr);
   bool emitDeclarations();
   bool emitNode(const hl::Node& node, int level);
   bool emitBasicBlock(const llvm::BasicBlock* BB, int level);
@@ -83,8 +92,19 @@ private:
   std::string getSignedType(llvm::Type* T);
   std::string mapType(const llvm::Type* T);
   std::string mapType(const llvm::Value* V);
+  std::string mapArgumentType(const llvm::Argument& A,
+                              const AddressSpaceSignature* addressSpaces);
   std::string getAddressSpaceKeyword(unsigned AS);
   void analyzeCallInsts();
+  void analyzeFunctionAddressSpaceSpecializations(const std::vector<llvm::Function*>& sortedFunctions);
+  AddressSpaceSignature getDefaultAddressSpaceSignature(const llvm::Function& F) const;
+  AddressSpaceSignature getCallAddressSpaceSignature(const llvm::CallInst* CI);
+  bool needsAddressSpaceSpecialization(const llvm::Function& F,
+                                       const AddressSpaceSignature& signature) const;
+  bool addFunctionAddressSpaceSpecialization(const llvm::Function& F,
+                                             const AddressSpaceSignature& signature);
+  std::string specializedFunctionName(const llvm::Function& F,
+                                      const AddressSpaceSignature* addressSpaces) const;
   void analyzeAtomicI64Storage();
   void collectVariablesInfo(const llvm::Function& F);
   unsigned getPhysicalPointerAddressSpace(const llvm::Value* V);
@@ -113,6 +133,8 @@ private:
   std::unordered_map<const llvm::Value*, std::string> valuesToDeclare;
   //
   std::unordered_map<const llvm::Value*, unsigned> inferredPtrAS;
+  std::unordered_map<const llvm::Function*, std::vector<AddressSpaceSignature>> functionAddressSpaceSpecializations;
+  const AddressSpaceSignature* currentFunctionAddressSpaces = nullptr;
 
   // Change 1: set of SSA values whose i64 storage backs an atomic_ref<uint64_t>
   // (or equivalent SYCL atomic i64 op). mapType(Value*) consults this to emit
